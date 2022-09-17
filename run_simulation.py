@@ -1,6 +1,7 @@
 # import python modules
 import os
 import time
+import yaml
 from datetime import datetime
 
 # import isaacgym modules
@@ -10,15 +11,15 @@ from isaacgym import gymtorch
 # import 3rd party modules
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
 from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
 
-# import user modules
-from grasp_planner import ThompsonSamplingGraspPlanner
-from grasp_planner import AntipodalGrasp
+
+from src.gqcnn import GQCNN
+from src.grasp_sampler import AntipodalGrasp, AntipodalGraspSampler
+from src.policy import (CrossEntropyGraspingPolicy,
+                        PosteriorGraspingPolicy,
+                        CrossEntorpyPosteriorGraspingPolicy)
 
 
 class SigulatePickingEnv(object):
@@ -28,15 +29,15 @@ class SigulatePickingEnv(object):
 
         # parse arguments / isaacgym configuration
         self.args = gymutil.parse_arguments(
-            description='GQ-CNN with TS',
+            description='GQ-CNN simulation',
             headless=True,
             no_graphics=True,
             custom_parameters=[
                 {
-                    "name": "--num_envs",
-                    "type": int,
-                    "default": 16,
-                    "help": "Number of environments to create"
+                    "name": "--config",
+                    "type": str,
+                    "default": "cfg/config.yaml",
+                    "help": "configuration file"
                 },
                 {
                     "name": "--save_results",
@@ -46,32 +47,58 @@ class SigulatePickingEnv(object):
                 },
             ],
         )
-        self.num_envs = self.args.num_envs
+        # self.num_envs = self.args.num_envs
         self.headless = self.args.headless
         self.save_results = self.args.save_results
-        self.num_per_row = 4
-        self.dt = 1.0 / 100.0
+        config_file = self.args.config
 
-        # grasp simulation configuration
-        self.target_object_name = "A2"
-        self.object_rand_pose_range = 0.1
-        self.camera_matrix = np.array([525, 0, 320, 0, 525, 240, 0, 0, 1]).reshape(3, 3)  # primsense 1.08
-        # self.camera_matrix = np.array([552.5, 0, 258, 0, 552.5, 193, 0, 0, 1]).reshape(3, 3)  # phoxi s
+        # load configuration
+        with open(config_file, "r") as f:
+            cfg = yaml.safe_load(f)
+        sim_cfg = cfg["simulation"]
+        policy_cfg = cfg["policy"]
+        sampling_cfg = cfg["sampling"]
 
-        # save directory
+        # load gqcnn, sampler, and policy
+        gqcnn = GQCNN()
+        sampler = AntipodalGraspSampler(sampling_cfg)
+        if policy_cfg["type"] == "posterior":
+            self.policy = PosteriorGraspingPolicy(
+                gqcnn, sampler, policy_cfg)
+        elif policy_cfg["type"] == "cross_entropy":
+            self.policy = CrossEntropyGraspingPolicy(
+                gqcnn, sampler, policy_cfg)
+        else:
+            policy_cfg["type"] = "cross_entropy_posterior"
+            self.policy = CrossEntorpyPosteriorGraspingPolicy(
+                gqcnn, sampler, policy_cfg)
+
+        # set up simulation
+        self.dt = sim_cfg["dt"]
+        self.num_main_iters = sim_cfg["num_main_iters"]
+        self.num_sub_iters = sim_cfg["num_sub_iters"]
+        self.target_object_name = sim_cfg["target_object"]
+        self.object_rand_pose_range = sim_cfg["object_random_pose_range"]
+        self.max_num_stable_pose = sim_cfg["max_num_stable_pose"]
+        cx = sim_cfg["camera"]["phoxi"]["cx"]
+        cy = sim_cfg["camera"]["phoxi"]["cy"]
+        fx = sim_cfg["camera"]["phoxi"]["fx"]
+        fy = sim_cfg["camera"]["phoxi"]["fy"]
+        self.camera_matrix = np.array([
+            [fx, 0, cx],
+            [0, fy, cy],
+            [0, 0, 1]])
+
+        # configure save directory
         if self.save_results:
             root_dir = '/media/sungwon/WorkSpace/projects/gqcnn_thomphson_sampling'
-            cur_date = datetime.today().strftime("%Y-%m-%d-%H%M")
-            self.save_dir = os.path.join(root_dir, cur_date)
+            self.save_dir = os.path.join(root_dir, self.target_object_name, policy_cfg["type"])
             os.makedirs(self.save_dir, exist_ok=True)
 
-            # make a directory each data type
-            os.makedirs(os.path.join(self.save_dir, 'success_features'), exist_ok=True)
-            os.makedirs(os.path.join(self.save_dir, 'failure_features'), exist_ok=True)
-            os.makedirs(os.path.join(self.save_dir, 'success_q_values'), exist_ok=True)
-            os.makedirs(os.path.join(self.save_dir, 'failure_q_values'), exist_ok=True)
-            os.makedirs(os.path.join(self.save_dir, 'grasp_cp1'), exist_ok=True)
-            os.makedirs(os.path.join(self.save_dir, 'grasp_cp2'), exist_ok=True)
+            # save config files
+            save_cfg_file = os.path.join(root_dir, self.target_object_name) + "/{}_config.yaml".format(policy_cfg["type"])
+            with open(os.path.join(save_cfg_file), "w") as f:
+                yaml.safe_dump(cfg, f)
 
         # custom env variables
         self.envs = []
@@ -93,8 +120,8 @@ class SigulatePickingEnv(object):
         self.gym.prepare_sim(
             self.sim)  # Prepares simulation with buffer allocations
 
-        # initialize grasp planner
-        self.grasp_planner = ThompsonSamplingGraspPlanner()
+        # prepare some tensors
+        self.average_reward = np.zeros((self.num_sub_iters, self.num_envs), dtype=np.float32)
 
     def __del__(self):
         self.gym.destroy_sim(self.sim)
@@ -249,7 +276,15 @@ class SigulatePickingEnv(object):
             asset_options.vhacd_params.max_convex_hulls = 50
             asset_options.vhacd_params.max_num_vertices_per_ch = 1000
         object_asset = self.gym.load_asset(self.sim, asset_root, object_asset_file, asset_options)
-        object_stable_poses = np.load("assets/urdf/egad_eval_set_urdf/{}/stable_poses.npy".format(self.target_object_name))[2:3]
+
+        # load object stable poses
+        object_stable_prob = np.load(
+            "assets/urdf/egad_eval_set_urdf/{}/stable_prob.npy".format(
+                self.target_object_name))[:self.max_num_stable_pose]
+        self.object_stable_prob = object_stable_prob / np.sum(object_stable_prob)
+        object_stable_poses = np.load(
+            "assets/urdf/egad_eval_set_urdf/{}/stable_poses.npy".format(
+                self.target_object_name))[:self.max_num_stable_pose]
         self.object_stable_poses = []
         for pose in object_stable_poses:
             # 4x4 transform matrix to gymapi.Transform
@@ -261,20 +296,20 @@ class SigulatePickingEnv(object):
             quat = r.as_quat()
             t.r = gymapi.Quat(quat[0], quat[1], quat[2], quat[3])
             self.object_stable_poses.append(t)
-            break
 
         ##############
         # CREATE ENV #
         ##############
         # configure env grid
-        print("Creating %d environments" % self.num_envs)
-        self.num_per_row = 4
+        self.num_envs = len(self.object_stable_poses)
+        num_per_row = int(np.ceil(np.sqrt(self.num_envs)))
         env_lower = gymapi.Vec3(-0.5, -0.5, 0.0)
         env_upper = gymapi.Vec3(0.5, 0.5, 2.0)
+        print("Creating %d environments" % self.num_envs)
         for env_idx in range(self.num_envs):
             # create env
             env = self.gym.create_env(self.sim, env_lower, env_upper,
-                                      self.num_per_row)
+                                      num_per_row)
 
             # add hand
             hand_handle = self.gym.create_actor(env, hand_asset, hand_pose, "hand_pose", env_idx, 1)
@@ -293,8 +328,6 @@ class SigulatePickingEnv(object):
             self.gym.set_rigid_body_segmentation_id(env, object_handle, 0, 1)
 
             # add camera sensor
-            # 2.0 : primsense 1.08
-            # 4.0 : phoxi s
             camera_props = gymapi.CameraProperties()
             camera_props.width = int(self.camera_matrix[0, 2] * 2.0)
             camera_props.height = int(self.camera_matrix[1, 2] * 2.0)
@@ -302,7 +335,7 @@ class SigulatePickingEnv(object):
             camera_props.far_plane = 1.0
             camera_handle = self.gym.create_camera_sensor(env, camera_props)
 
-            #! gym camera pos def: x=optical axis, y=left, z=down | convention: OpenGL
+            # gym camera pos def: x=optical axis, y=left, z=down | convention: OpenGL
             cam_pose = gymapi.Transform()
             cam_pose.p = gymapi.Vec3(-0.7*np.sin(0.075*np.pi), 0.0, 0.7*np.cos(0.075*np.pi))
             cam_pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 1, 0), np.deg2rad(90-13.5))
@@ -312,14 +345,17 @@ class SigulatePickingEnv(object):
                 cam_pose,
                 )
 
-            # convert z = x, x = -y, y = -z
-            rot = R.from_quat([cam_pose.r.x, cam_pose.r.y, cam_pose.r.z, cam_pose.r.w]).as_matrix()
-            rot_convert = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]])
-            rot = np.dot(rot, rot_convert)
-            self.camera_extr = np.eye(4)
-            self.camera_extr[:3, :3] = rot
-            self.camera_extr[:3, 3] = np.array([cam_pose.p.x, cam_pose.p.y, cam_pose.p.z])
+            # get camera extrinsic once
+            if env_idx == 0:
+                # convert z = x, x = -y, y = -z
+                rot = R.from_quat([cam_pose.r.x, cam_pose.r.y, cam_pose.r.z, cam_pose.r.w]).as_matrix()
+                rot_convert = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]])
+                rot = np.dot(rot, rot_convert)
+                self.camera_extr = np.eye(4)
+                self.camera_extr[:3, :3] = rot
+                self.camera_extr[:3, 3] = np.array([cam_pose.p.x, cam_pose.p.y, cam_pose.p.z])
 
+            # append handles
             self.envs.append(env)
             self.hand_handles.append(hand_handle)
             self.object_handles.append(object_handle)
@@ -379,7 +415,7 @@ class SigulatePickingEnv(object):
                 self.envs[env_idx], self.object_handles[env_idx], 0)
 
             # get stable pose
-            t_stable = self.object_stable_poses[np.random.randint(len(self.object_stable_poses))]
+            t_stable = self.object_stable_poses[env_idx]
             p_stable = t_stable.p
             q_stable = t_stable.r
 
@@ -414,218 +450,93 @@ class SigulatePickingEnv(object):
 
         return reset_object_poses
 
-    def step(self, time_step=0):
-        ############
-        # STEPPING #
-        ############
-        # step the physics
-        self.gym.simulate(self.sim)
-
-        # refresh results
-        self.gym.fetch_results(self.sim, True)
-        self.gym.refresh_dof_state_tensor(self.sim)
-
-        # step rendering
-        self.render()
-
-        ##################
-        # AFTER STEPPING #
-        ##################
-        if False:
-            self.reset_env()
-            self.wait(0.01)
-
-            # draw camera pose with line
-            camera_pose = self.camera_extr
-
-            # 4x4 matrix to gymapi.Transform
-            rot = camera_pose[:3, :3]
-            quat = R.from_matrix(rot).as_quat()
-            pose = gymapi.Transform()
-            pose.r = gymapi.Quat(quat[0], quat[1], quat[2], quat[3])
-            pose.p = gymapi.Vec3(camera_pose[0, 3], camera_pose[1, 3], camera_pose[2, 3])
-
-            # draw line
-            axes_geom = gymutil.AxesGeometry(1.0)
-            gymutil.draw_lines(axes_geom, self.gym, self.viewer, self.envs[15], pose)
-            self.wait(10.0)
-
-            self.gym.render_all_camera_sensors(self.sim)
-            depth_image = self.gym.get_camera_image(self.sim, self.envs[15], self.camera_handles[15], gymapi.IMAGE_DEPTH) * -1
-            segmask = self.gym.get_camera_image(self.sim, self.envs[15], self.camera_handles[15], gymapi.IMAGE_SEGMENTATION)
-            plt.imshow(depth_image)
-            plt.show()
-            return
-
-        if False:
-            self.gym.render_all_camera_sensors(self.sim)
-            for i in range(self.num_envs):
-                depth_image = self.gym.get_camera_image(self.sim, self.envs[i], self.camera_handles[i], gymapi.IMAGE_DEPTH)
-                segmask = self.gym.get_camera_image(self.sim, self.envs[i], self.camera_handles[i], gymapi.IMAGE_SEGMENTATION)
-                plt.imshow(depth_image)
-                plt.show()
-
+    def step(self, main_step=0, sub_step=0):
         # reset evn
         object_poses = self.reset_env()
         self.wait(0.01)
 
-        if True:
-            # sample grasp
-            features, q_values, indices, grasps = self.sample_grasp()
+        # get depth image
+        depth_images, segmasks = self.get_camera_image()
 
-            # convert antipodal grasp to 3d grasp
-            grasp_poses = []
-            for grasp in grasps:
-                if grasp is None:
-                    grasp_pose = np.array([0, 0, 0.5, 0], dtype=np.float32)
-                else:
-                    assert isinstance(grasp, AntipodalGrasp)
-                    grasp_pose_camera = grasp.get_3d_grasp_pose(
-                        np.array([0, 0, -1], dtype=np.float32),
-                        self.camera_matrix,
-                        self.camera_extr)
-                    grasp_pose_world = self.camera_extr @ grasp_pose_camera
-                    grasp_theta = -np.arctan2(grasp_pose_world[1, 0], grasp_pose_world[0, 0])
-                    if grasp_theta > np.pi/2:
-                        grasp_theta -= np.pi
-                    elif grasp_theta < -np.pi/2:
-                        grasp_theta += np.pi
-                    grasp_pose = np.array([grasp_pose_world[0, 3], grasp_pose_world[1, 3], grasp_pose_world[2, 3], grasp_theta], dtype=np.float32)
-                grasp_poses.append(grasp_pose)
-            grasp_poses = np.array(grasp_poses, dtype=np.float32)
-            grasp_poses = torch.from_numpy(grasp_poses).to(self.device)
-            self.wait(0.01)
+        # sample grasp
+        action = self.policy.action(depth_images, segmasks)
+        grasps = action[0]
+        q_values = np.array(action[1], dtype=np.float32)
+        im_tensors = np.array(action[2], dtype=np.float32)
+        depth_tensors = np.array(action[3], dtype=np.float32)
+        features = np.array(action[4], dtype=np.float32)
 
-        # debug sample mode
-        if False:
-            grasp_pose = np.array([0.0, 0.0, 0.02, np.pi/2], dtype=np.float32)
-            grasp_pose = np.tile(grasp_pose, [self.num_envs, 1])
-            grasp_poses = torch.from_numpy(grasp_pose).to(self.device)
-            print('sample grasps')
-            self.wait(0.01)
+        # convert antipodal grasp to 3d grasp
+        grasp_poses = self.convert_to_grasp_pose(grasps)
 
         # visualize grasps
-        # get grasp pose in object frame
-        grasp_cp1 = []
-        grasp_cp2 = []
-        for env_idx in range(self.num_envs):
-            # if there is no grasp, skip
-            if grasps[env_idx] is None:
-                continue
+        grasp_contact_points = self.get_grasp_pose_on_object(grasp_poses, object_poses)
 
-            center = grasp_poses[env_idx][:3]
-            theta = grasp_poses[env_idx][3]
+        # execute grasp
+        self.execute_grasp(grasp_poses)
 
-            l = 0.1
-            cp1_offset = np.array([l*np.sin(theta), l*np.cos(theta), 0.0], dtype=np.float32)
-            cp2_offset = -cp1_offset
+        # evaluate grasp
+        rewards = self.evaluate_grasp()
 
-            cp1 = center + cp1_offset
-            cp1 = gymapi.Vec3(cp1[0], cp1[1], cp1[2])
-            cp2 = center + cp2_offset
-            cp2 = gymapi.Vec3(cp2[0], cp2[1], cp2[2])
-            color = gymapi.Vec3(1.0, 0.0, 0.0)
+        # update likelihood per main step
+        if sub_step == 0:
+            # update likelihood
+            if isinstance(self.policy, PosteriorGraspingPolicy):
+                # get valid indices
+                valid_indices = []
+                for env_idx in range(self.num_envs):
+                    if grasps[env_idx] is not None:
+                        valid_indices.append(env_idx)
+                valid_indices = np.array(valid_indices, dtype=np.int32)
 
-            # draw grasps in gym
-            if self.viewer:
-                gymutil.draw_line(cp1, cp2, color, self.gym, self.viewer, self.envs[env_idx])
+                # get update based on stable pose probability
+                prob = self.object_stable_prob[valid_indices]
+                prob /= np.sum(prob)
+                update_idx = np.random.choice(
+                    valid_indices,
+                    size=1,
+                    p=prob)
+                self.policy.update(features[update_idx], rewards[update_idx])
 
-            # convert to object frame
-            t_wo = object_poses[env_idx]
-            cp1 = t_wo.inverse().transform_point(cp1)
-            cp2 = t_wo.inverse().transform_point(cp2)
-            grasp_cp1.append(np.array([cp1.x, cp1.y, cp1.z], dtype=np.float32))
-            grasp_cp2.append(np.array([cp2.x, cp2.y, cp2.z], dtype=np.float32))
-        grasp_cp1 = np.array(grasp_cp1, dtype=np.float32)
-        grasp_cp2 = np.array(grasp_cp2, dtype=np.float32)
-        self.wait(1.0)
+                # save update history
+                if self.save_results:
+                    np.save(os.path.join(self.save_dir, 'updated_feature_{:03d}_{:02d}.npy'.format(main_step, sub_step)), features[update_idx])
+                    np.save(os.path.join(self.save_dir, 'updated_reward_{:03d}_{:02d}.npy'.format(main_step, sub_step)), rewards[update_idx])
+            elif isinstance(self.policy, CrossEntorpyPosteriorGraspingPolicy):
+                pass
 
-        # 2) execute x, y, theta movement
-        xyt_idx = [0, 1, 3]
-        self.target_dof_pos[:, xyt_idx] = grasp_poses[:, xyt_idx]
-        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.target_dof_pos))
-        self.wait(0.5)
-
-        # 3) execute z movement
-        self.target_dof_pos[:, 2] = grasp_poses[:, 2]
-        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.target_dof_pos))
-        self.wait(0.5)
-
-        # 4) execute grasp
-        self.target_dof_pos[:, 4:] = 0.0
-        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.target_dof_pos))
-        self.wait(0.5)
-
-        # 5) enable gravity on objects and execute lift
-        self.target_dof_pos[:, 2] = 0.5
-        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.target_dof_pos))
-        # enable gravity
-        for env_idx in range(self.num_envs):
-            obj_props = self.gym.get_actor_rigid_body_properties(self.envs[env_idx], self.object_handles[env_idx])
-            obj_props[0].flags = gymapi.RIGID_BODY_NONE
-            self.gym.set_actor_rigid_body_properties(self.envs[env_idx], self.object_handles[env_idx], obj_props, False)
-        self.wait(1.0)
-
-        # 6) evaluate grasp
-        success_features = []
-        failure_features = []
-        success_q_values = []
-        failure_q_values = []
-        for env_idx in range(self.num_envs):
-            # if there is no grasp, skip
-            if indices[env_idx] is None:
-                continue
-
-            # evaluate object is successfully lifted up
-            obj_height = self.gym.get_actor_rigid_body_states(
-                self.envs[env_idx],
-                self.object_handles[env_idx],
-                gymapi.STATE_POS)[0]['pose']['p']['z']
-            if obj_height > 0.25:
-                success_features.append(
-                    features[env_idx][indices[env_idx]])
-                success_q_values.append(
-                    q_values[env_idx][indices[env_idx]])
-            else:
-                failure_features.append(
-                    features[env_idx][indices[env_idx]])
-                failure_q_values.append(
-                    q_values[env_idx][indices[env_idx]])
-        success_features = np.array(success_features)
-        failure_features = np.array(failure_features)
-        success_q_values = np.array(success_q_values)
-        failure_q_values = np.array(failure_q_values)
-
-        # update likelihood
-        self.grasp_planner.update(success_features, failure_features)
-        print('success: {}, failure: {}'.format(success_features.shape[0], failure_features.shape[0]))
+        # print result
+        self.average_reward[sub_step, :] = rewards
+        if sub_step == self.num_sub_iters - 1:
+            average_reward = np.mean(self.average_reward, axis=0)
+            average_reward = np.dot(average_reward, self.object_stable_prob)
+            print('main_step: {:03d}, average_reward: {:.3f}'.format(main_step, average_reward))
 
         # save data
         if self.save_results:
-            np.save(os.path.join(self.save_dir, 'success_features', '{}.npy'.format(int(time_step))), success_features)
-            np.save(os.path.join(self.save_dir, 'failure_features', '{}.npy'.format(int(time_step))), failure_features)
-            np.save(os.path.join(self.save_dir, 'success_q_values', '{}.npy'.format(int(time_step))), success_q_values)
-            np.save(os.path.join(self.save_dir, 'failure_q_values', '{}.npy'.format(int(time_step))), failure_q_values)
-
-            # save object poses
-            np.save(os.path.join(self.save_dir, 'grasp_cp1', '{}.npy'.format(int(time_step))), grasp_cp1)
-            np.save(os.path.join(self.save_dir, 'grasp_cp2', '{}.npy'.format(int(time_step))), grasp_cp2)
-
+            np.save(os.path.join(self.save_dir, 'q_values_{:03d}_{:02d}.npy'.format(main_step, sub_step)), q_values)
+            np.save(os.path.join(self.save_dir, 'im_tensors_{:03d}_{:02d}.npy'.format(main_step, sub_step)), im_tensors)
+            np.save(os.path.join(self.save_dir, 'depth_tensors_{:03d}_{:02d}.npy'.format(main_step, sub_step)), depth_tensors)
+            np.save(os.path.join(self.save_dir, 'features_{:03d}_{:02d}.npy'.format(main_step, sub_step)), features)
+            np.save(os.path.join(self.save_dir, 'rewards_{:03d}_{:02d}.npy'.format(main_step, sub_step)), rewards)
+            np.save(os.path.join(self.save_dir, 'grasp_contact_points_{:03d}_{:02d}.npy'.format(main_step, sub_step)), grasp_contact_points)
         return None
 
     ############################################
     # robot, sensor and environment interfaces #
     ############################################
-    # def wait(self, time=0.5):
-    #     # wait for time seconds
-    #     self.wait_timer += self.dt
-    #     if self.wait_timer > time:
-    #         self.wait_timer = 0.0
-    #         return True
-    #     else:
-    #         return False
-
     def wait(self, sleep_time=0.5):
+        """Wait for a given time in seconds.
+
+        Blocks the execution of the program for a given time in seconds.
+        Simulation steps are executed in the background.
+
+        Args:
+            sleep_time (float, optional): sleep time. Defaults to 0.5.
+
+        Returns:
+            success (bool): True if successful, False otherwise.
+        """
         # wait for time seconds
         while not self.wait_timer > sleep_time:
             # step the physics
@@ -641,8 +552,139 @@ class SigulatePickingEnv(object):
         self.wait_timer = 0.0
         return True
 
-    def sample_grasp(self):
-        # render depth images ans segmasks
+    def convert_to_grasp_pose(self, grasps):
+        """Convert antipodal grasp to (x, y, z, theta) grasp pose in world frame.
+
+        Args:
+            grasps (list of AntipodalGrasp): Antipodal grasps.
+
+        Returns:
+            grasp_poses (numpy.ndarray): (x, y, z, theta) of grasp. (N, 4)
+        """
+        grasp_poses = []
+        for grasp in grasps:
+            if isinstance(grasp, AntipodalGrasp):
+                grasp_pose_camera = grasp.get_3d_grasp_pose(
+                    np.array([0, 0, -1], dtype=np.float32),
+                    self.camera_matrix,
+                    self.camera_extr)
+                grasp_pose_world = self.camera_extr @ grasp_pose_camera
+                grasp_theta = -np.arctan2(grasp_pose_world[1, 0], grasp_pose_world[0, 0])
+                if grasp_theta > np.pi/2:
+                    grasp_theta -= np.pi
+                elif grasp_theta < -np.pi/2:
+                    grasp_theta += np.pi
+                grasp_pose = np.array([grasp_pose_world[0, 3], grasp_pose_world[1, 3], grasp_pose_world[2, 3], grasp_theta], dtype=np.float32)
+            else:
+                grasp_pose = np.array([0, 0, 0.5, 0], dtype=np.float32)
+            grasp_poses.append(grasp_pose)
+        grasp_poses = np.array(grasp_poses, dtype=np.float32)
+        grasp_poses = torch.from_numpy(grasp_poses).to(self.device)
+        return grasp_poses
+
+    def get_grasp_pose_on_object(self, grasp_poses, object_poses, visualize=True):
+        """Visualize grasps in the environment
+
+        Args:
+            grasp_poses (numpy.ndarray): (x, y, z, theta) grasp poses in the world frame. (num_envs, 4)
+            object_poses (numpy.ndarray): object poses in the world frame. (num_envs, 4, 4)
+
+        Returns:
+            grasp_contact_points (numpy.ndarray): contact points of the grasp in the world frame. (num_envs, 2, 3)
+        """
+        # get grasp pose in object frame
+        grasp_cp1 = []
+        grasp_cp2 = []
+        for env_idx in range(self.num_envs):
+            center = grasp_poses[env_idx][:3]
+            theta = grasp_poses[env_idx][3]
+
+            l = 0.1
+            cp1_offset = np.array([l*np.sin(theta), l*np.cos(theta), 0.0], dtype=np.float32)
+            cp2_offset = -cp1_offset
+
+            cp1 = center + cp1_offset
+            cp1 = gymapi.Vec3(cp1[0], cp1[1], cp1[2])
+            cp2 = center + cp2_offset
+            cp2 = gymapi.Vec3(cp2[0], cp2[1], cp2[2])
+            color = gymapi.Vec3(1.0, 0.0, 0.0)
+
+            # draw grasps in gym
+            if self.viewer:
+                if visualize:
+                    gymutil.draw_line(
+                        cp1, cp2, color,
+                        self.gym, self.viewer, self.envs[env_idx])
+
+            # convert to object frame
+            t_wo = object_poses[env_idx]
+            cp1 = t_wo.inverse().transform_point(cp1)
+            cp2 = t_wo.inverse().transform_point(cp2)
+            grasp_cp1.append(np.array([cp1.x, cp1.y, cp1.z], dtype=np.float32))
+            grasp_cp2.append(np.array([cp2.x, cp2.y, cp2.z], dtype=np.float32))
+        grasp_cp1 = np.array(grasp_cp1, dtype=np.float32)
+        grasp_cp2 = np.array(grasp_cp2, dtype=np.float32)
+        grasp_contact_points = np.stack([grasp_cp1, grasp_cp2], axis=1)
+        self.wait(self.dt)
+        return grasp_contact_points
+
+    def execute_grasp(self, grasp_poses):
+        """Execute grasp in simulation
+
+        Args:
+            grasp_poses (numpy.ndarray): grasp poses in world frame. (num_envs, (x, y, z, theta))
+        """
+        # 1) execute x, y, theta movement
+        xyt_idx = [0, 1, 3]
+        self.target_dof_pos[:, xyt_idx] = grasp_poses[:, xyt_idx]
+        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.target_dof_pos))
+        self.wait(0.5)
+
+        # 2) execute z movement
+        self.target_dof_pos[:, 2] = grasp_poses[:, 2]
+        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.target_dof_pos))
+        self.wait(0.5)
+
+        # 3) execute grasp
+        self.target_dof_pos[:, 4:] = 0.0
+        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.target_dof_pos))
+        self.wait(0.5)
+
+        # 4) enable gravity on objects and execute lift
+        self.target_dof_pos[:, 2] = 0.5
+        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.target_dof_pos))
+        # enable gravity
+        for env_idx in range(self.num_envs):
+            obj_props = self.gym.get_actor_rigid_body_properties(self.envs[env_idx], self.object_handles[env_idx])
+            obj_props[0].flags = gymapi.RIGID_BODY_NONE
+            self.gym.set_actor_rigid_body_properties(self.envs[env_idx], self.object_handles[env_idx], obj_props, False)
+        self.wait(1.0)
+
+    def visualize_camera_axis(self):
+        """Visualize camera axis"""
+        # draw camera pose with line
+        camera_pose = self.camera_extr
+
+        # 4x4 matrix to gymapi.Transform
+        rot = camera_pose[:3, :3]
+        quat = R.from_matrix(rot).as_quat()
+        pose = gymapi.Transform()
+        pose.r = gymapi.Quat(quat[0], quat[1], quat[2], quat[3])
+        pose.p = gymapi.Vec3(camera_pose[0, 3], camera_pose[1, 3], camera_pose[2, 3])
+
+        # draw line
+        axes_geom = gymutil.AxesGeometry(1.0)
+        for env_idx in range(self.num_envs):
+            gymutil.draw_lines(axes_geom, self.gym, self.viewer, self.envs[env_idx], pose)
+        self.wait(self.dt)
+
+    def get_camera_image(self):
+        """Get images from camera
+
+        Returns:
+            depth_images (numpy.ndarray): image of shape (num_envs, H, W, 3)
+            segmasks (numpy.ndarray): segmentation mask of shape (num_envs, H, W)
+        """
         depth_images = []
         segmasks = []
         self.gym.render_all_camera_sensors(self.sim)
@@ -651,17 +693,27 @@ class SigulatePickingEnv(object):
             segmask = self.gym.get_camera_image(self.sim, self.envs[i], self.camera_handles[i], gymapi.IMAGE_SEGMENTATION)
             depth_images.append(depth_image)
             segmasks.append(segmask)
-        depth_images = np.array(depth_images) * -1.0
+        depth_images = np.array(depth_images) * -1
         segmasks = np.array(segmasks)
+        return depth_images, segmasks
 
-        # get grasps
-        features, q_values, indices, grasps = self.grasp_planner.plan(depth_images, segmasks)
-        return features, q_values, indices, grasps
+    def evaluate_grasp(self):
+        reward = np.zeros(self.num_envs, dtype=np.float32)
+        for env_idx in range(self.num_envs):
+            obj_height = self.gym.get_actor_rigid_body_states(
+                self.envs[env_idx],
+                self.object_handles[env_idx],
+                gymapi.STATE_POS)[0]['pose']['p']['z']
+            if obj_height > 0.25:
+                reward[env_idx] = 1.0
+        return reward
 
 
 if __name__ == '__main__':
-    picking_evn = SigulatePickingEnv()
+    env = SigulatePickingEnv()
 
-    for i in range(500):
-        picking_evn.step(i)
-        # a = input("{}".format(i))
+    for i in range(env.num_main_iters):
+        for j in range(env.num_sub_iters):
+            start_time = time.time()
+            env.step(i, j)
+            print('[{}][{}] step time: {:.3f}'.format(i, j, time.time() - start_time))
