@@ -123,7 +123,7 @@ class CrossEntropyGraspingPolicy(object):
             start_time = time.time()
             im_tensors, depth_tensors = [], []
             grasp_to_tensor(depth_images[0], grasp_candidates[0])
-            with Pool(16) as p:
+            with Pool(12) as p:
                 temp = p.starmap(grasp_to_tensor, zip(depth_images, grasp_candidates))
             for i in range(batch_size):
                 im_tensors.append(temp[i][0])
@@ -212,7 +212,7 @@ class CrossEntropyGraspingPolicy(object):
 
         Returns:
             list: list of grasps. If no grasp is found, return `None` for corresponding env.
-            list: list of grasp quality. If no grasp is found, return `-1` for corresponding env.
+            list: list of grasp quality. If no grasp is found, return `0` for corresponding env.
             list: list of image tensors. If no grasp is found, return `zero image` for corresponding env.
             list: list of depth tensors. If no grasp is found, return `zero depth` for corresponding env.
             list: list of features. If no grasp is found, return `zero feature` for corresponding env.
@@ -226,7 +226,7 @@ class CrossEntropyGraspingPolicy(object):
         start_time = time.time()
         im_tensors, depth_tensors = [], []
         grasp_to_tensor(depth_images[0], grasp_candidates[0])
-        with Pool(16) as p:
+        with Pool(12) as p:
             temp = p.starmap(grasp_to_tensor, zip(depth_images, grasp_candidates))
         for i in range(batch_size):
             im_tensors.append(temp[i][0])
@@ -252,13 +252,15 @@ class CrossEntropyGraspingPolicy(object):
         best_im_tensors = []
         best_depth_tensors = []
         best_features = []
+        best_posteriors = []
         for i in range(batch_size):
             if len(im_tensors[i]) == 0:
                 best_grasps.append(None)
-                best_q_values.append(-1)
+                best_q_values.append(0)
                 best_im_tensors.append(np.zeros((32, 32, 1)))
                 best_depth_tensors.append(np.zeros((1,)))
                 best_features.append(np.zeros((128,)))
+                best_posteriors.append(0)
             else:
                 best_index = np.argmax(q_values[i])
                 best_grasps.append(grasp_candidates[i][best_index])
@@ -266,12 +268,14 @@ class CrossEntropyGraspingPolicy(object):
                 best_im_tensors.append(im_tensors[i][best_index])
                 best_depth_tensors.append(depth_tensors[i][best_index])
                 best_features.append(features[i][best_index])
+                best_posteriors.append(0)
         return (
             best_grasps,
             best_q_values,
             best_im_tensors,
             best_depth_tensors,
-            best_features)
+            best_features,
+            best_posteriors)
 
 
 class PosteriorGraspingPolicy(object):
@@ -321,7 +325,7 @@ class PosteriorGraspingPolicy(object):
         """
         # if there are no samples, return None
         if len(q_values) == 0:
-            return None
+            return None, None
 
         # get success and failure features
         success_features = self.feature_history[self.reward_history == 1]
@@ -344,12 +348,13 @@ class PosteriorGraspingPolicy(object):
         b = self.prior_strength*(1.0 - q_values) + 1e-10
 
         # get posterior
-        prob = np.random.beta(a + n, b + m)
-        idx = np.argmax(prob)
+        posterior = (a + n) / (a + b + n + m)
+        random_posterior = np.random.beta(a + n, b + m)
+        idx = np.argmax(random_posterior)
 
         # print('prios: {:.2f}, {:.2f} | likelihood: {:04.0f}, {:04.0f} | posterior: {:07.2f}, {:07.2f} | prob: {:.2f}'.format(
         #     a[idx], b[idx], n[idx], m[idx], (a+n)[idx], (b+m)[idx], prob[idx]))
-        return idx
+        return idx, posterior[idx]
 
     def action(self, depth_images, segmasks, verbose=False):
         """Return a list of grasp candidate for each env.
@@ -361,7 +366,7 @@ class PosteriorGraspingPolicy(object):
 
         Returns:
             list: list of grasps. If no grasp is found, return `None` for corresponding env.
-            list: list of grasp quality. If no grasp is found, return `-1` for corresponding env.
+            list: list of grasp quality. If no grasp is found, return `0` for corresponding env.
             list: list of image tensors. If no grasp is found, return `zero image` for corresponding env.
             list: list of depth tensors. If no grasp is found, return `zero depth` for corresponding env.
             list: list of features. If no grasp is found, return `zero feature` for corresponding env.
@@ -381,7 +386,7 @@ class PosteriorGraspingPolicy(object):
         start_time = time.time()
         im_tensors, depth_tensors = [], []
         grasp_to_tensor(depth_images[0], grasp_candidates[0])
-        with Pool(16) as p:
+        with Pool(12) as p:
             temp = p.starmap(grasp_to_tensor, zip(depth_images, grasp_candidates))
         for i in range(len(temp)):
             im_tensors.append(temp[i][0])
@@ -406,32 +411,35 @@ class PosteriorGraspingPolicy(object):
         best_im_tensors = []
         best_depth_tensors = []
         best_features = []
+        best_posteriors = []
         for i in range(batch_size):
             # get features
             features_i = np.array(features[i])
             q_values_i = np.array(q_values[i])
 
             # get best grasp
-            idx = self.posterior_sample(features_i, q_values_i)
+            idx, posterior = self.posterior_sample(features_i, q_values_i)
             if idx is None:
                 best_grasps.append(None)
-                best_q_values.append(-1)
+                best_q_values.append(0)
                 best_im_tensors.append(np.zeros((32, 32, 1)))
                 best_depth_tensors.append(np.zeros((1,)))
                 best_features.append(np.zeros((128,)))
+                best_posteriors.append(0)
             else:
                 best_grasps.append(grasp_candidates[i][idx])
                 best_q_values.append(q_values_i[idx])
                 best_im_tensors.append(im_tensors[i][idx])
                 best_depth_tensors.append(depth_tensors[i][idx])
                 best_features.append(features_i[idx])
-
+                best_posteriors.append(posterior)
         return (
             best_grasps,
             best_q_values,
             best_im_tensors,
             best_depth_tensors,
-            best_features)
+            best_features,
+            best_posteriors)
 
 
 class CrossEntorpyPosteriorGraspingPolicy(object):

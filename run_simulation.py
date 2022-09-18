@@ -11,6 +11,7 @@ from isaacgym import gymtorch
 # import 3rd party modules
 import numpy as np
 import torch
+from torch.utils.tensorboard import SummaryWriter
 from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
 
@@ -80,6 +81,8 @@ class SigulatePickingEnv(object):
         self.target_object_name = sim_cfg["target_object"]
         self.object_rand_pose_range = sim_cfg["object_random_pose_range"]
         self.max_num_stable_pose = sim_cfg["max_num_stable_pose"]
+        self.min_stable_pose_prob = sim_cfg["min_stable_pose_prob"]
+
         cx = sim_cfg["camera"]["phoxi"]["cx"]
         cy = sim_cfg["camera"]["phoxi"]["cy"]
         fx = sim_cfg["camera"]["phoxi"]["fx"]
@@ -90,15 +93,17 @@ class SigulatePickingEnv(object):
             [0, 0, 1]])
 
         # configure save directory
+        root_dir = '/media/sungwon/WorkSpace/projects/gqcnn_thomphson_sampling'
+        self.save_dir = os.path.join(root_dir, self.target_object_name, policy_cfg["type"])
         if self.save_results:
-            root_dir = '/media/sungwon/WorkSpace/projects/gqcnn_thomphson_sampling'
-            self.save_dir = os.path.join(root_dir, self.target_object_name, policy_cfg["type"])
+            # create save directory
             os.makedirs(self.save_dir, exist_ok=True)
+            os.makedirs(os.path.join(self.save_dir, 'data'), exist_ok=True)
 
             # save config files
-            save_cfg_file = os.path.join(root_dir, self.target_object_name) + "/{}_config.yaml".format(policy_cfg["type"])
-            with open(os.path.join(save_cfg_file), "w") as f:
+            with open(os.path.join(self.save_dir, 'config.yaml'), "w") as f:
                 yaml.safe_dump(cfg, f)
+        self.writer = SummaryWriter(os.path.join(self.save_dir, 'logs'))
 
         # custom env variables
         self.envs = []
@@ -122,6 +127,8 @@ class SigulatePickingEnv(object):
 
         # prepare some tensors
         self.average_reward = np.zeros((self.num_sub_iters, self.num_envs), dtype=np.float32)
+        self.average_q_value = np.zeros((self.num_sub_iters, self.num_envs), dtype=np.float32)
+        self.average_posterior = np.zeros((self.num_sub_iters, self.num_envs), dtype=np.float32)
 
     def __del__(self):
         self.gym.destroy_sim(self.sim)
@@ -280,11 +287,12 @@ class SigulatePickingEnv(object):
         # load object stable poses
         object_stable_prob = np.load(
             "assets/urdf/egad_eval_set_urdf/{}/stable_prob.npy".format(
-                self.target_object_name))[:self.max_num_stable_pose]
+                self.target_object_name))
+        object_stable_prob = object_stable_prob[object_stable_prob > self.min_stable_pose_prob][:self.max_num_stable_pose]
         self.object_stable_prob = object_stable_prob / np.sum(object_stable_prob)
         object_stable_poses = np.load(
             "assets/urdf/egad_eval_set_urdf/{}/stable_poses.npy".format(
-                self.target_object_name))[:self.max_num_stable_pose]
+                self.target_object_name))[:len(object_stable_prob)]
         self.object_stable_poses = []
         for pose in object_stable_poses:
             # 4x4 transform matrix to gymapi.Transform
@@ -465,6 +473,7 @@ class SigulatePickingEnv(object):
         im_tensors = np.array(action[2], dtype=np.float32)
         depth_tensors = np.array(action[3], dtype=np.float32)
         features = np.array(action[4], dtype=np.float32)
+        posteriors = np.array(action[5], dtype=np.float32)
 
         # convert antipodal grasp to 3d grasp
         grasp_poses = self.convert_to_grasp_pose(grasps)
@@ -500,26 +509,42 @@ class SigulatePickingEnv(object):
 
                 # save update history
                 if self.save_results:
-                    np.save(os.path.join(self.save_dir, 'updated_feature_{:03d}_{:02d}.npy'.format(main_step, sub_step)), features[update_idx])
-                    np.save(os.path.join(self.save_dir, 'updated_reward_{:03d}_{:02d}.npy'.format(main_step, sub_step)), rewards[update_idx])
+                    np.save(os.path.join(self.save_dir, 'data', 'updated_feature_{:03d}_{:02d}.npy'.format(main_step, sub_step)), features[update_idx])
+                    np.save(os.path.join(self.save_dir, 'data', 'updated_reward_{:03d}_{:02d}.npy'.format(main_step, sub_step)), rewards[update_idx])
             elif isinstance(self.policy, CrossEntorpyPosteriorGraspingPolicy):
                 pass
 
         # print result
         self.average_reward[sub_step, :] = rewards
+        self.average_q_value[sub_step, :] = q_values
+        self.average_posterior[sub_step, :] = posteriors
         if sub_step == self.num_sub_iters - 1:
             average_reward = np.mean(self.average_reward, axis=0)
             average_reward = np.dot(average_reward, self.object_stable_prob)
-            print('main_step: {:03d}, average_reward: {:.3f}'.format(main_step, average_reward))
+            average_q_value = np.mean(self.average_q_value, axis=0)
+            average_q_value = np.dot(average_q_value, self.object_stable_prob)
+            average_posterior = np.mean(self.average_posterior, axis=0)
+            average_posterior = np.dot(average_posterior, self.object_stable_prob)
+
+            metrics = {
+                'average_reward': average_reward,
+                'average_q_value': average_q_value,
+                'average_posterior': average_posterior}
+
+            self.writer.add_scalars('reward', metrics, main_step)
+            self.writer.flush()
+            print('main_step: {:03d}, E[r]: {:.3f}, E[q]: {:.3f}, E[p]: {:.3f}'.format(
+                main_step, average_reward, average_q_value, average_posterior))
+
 
         # save data
         if self.save_results:
-            np.save(os.path.join(self.save_dir, 'q_values_{:03d}_{:02d}.npy'.format(main_step, sub_step)), q_values)
-            np.save(os.path.join(self.save_dir, 'im_tensors_{:03d}_{:02d}.npy'.format(main_step, sub_step)), im_tensors)
-            np.save(os.path.join(self.save_dir, 'depth_tensors_{:03d}_{:02d}.npy'.format(main_step, sub_step)), depth_tensors)
-            np.save(os.path.join(self.save_dir, 'features_{:03d}_{:02d}.npy'.format(main_step, sub_step)), features)
-            np.save(os.path.join(self.save_dir, 'rewards_{:03d}_{:02d}.npy'.format(main_step, sub_step)), rewards)
-            np.save(os.path.join(self.save_dir, 'grasp_contact_points_{:03d}_{:02d}.npy'.format(main_step, sub_step)), grasp_contact_points)
+            np.save(os.path.join(self.save_dir, 'data', 'q_values_{:03d}_{:02d}.npy'.format(main_step, sub_step)), q_values)
+            np.save(os.path.join(self.save_dir, 'data', 'im_tensors_{:03d}_{:02d}.npy'.format(main_step, sub_step)), im_tensors)
+            np.save(os.path.join(self.save_dir, 'data', 'depth_tensors_{:03d}_{:02d}.npy'.format(main_step, sub_step)), depth_tensors)
+            np.save(os.path.join(self.save_dir, 'data', 'features_{:03d}_{:02d}.npy'.format(main_step, sub_step)), features)
+            np.save(os.path.join(self.save_dir, 'data', 'rewards_{:03d}_{:02d}.npy'.format(main_step, sub_step)), rewards)
+            np.save(os.path.join(self.save_dir, 'data', 'grasp_contact_points_{:03d}_{:02d}.npy'.format(main_step, sub_step)), grasp_contact_points)
         return None
 
     ############################################
@@ -658,7 +683,7 @@ class SigulatePickingEnv(object):
             obj_props = self.gym.get_actor_rigid_body_properties(self.envs[env_idx], self.object_handles[env_idx])
             obj_props[0].flags = gymapi.RIGID_BODY_NONE
             self.gym.set_actor_rigid_body_properties(self.envs[env_idx], self.object_handles[env_idx], obj_props, False)
-        self.wait(1.0)
+        self.wait(5.0)
 
     def visualize_camera_axis(self):
         """Visualize camera axis"""
