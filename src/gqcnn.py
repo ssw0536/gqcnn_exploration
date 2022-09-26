@@ -11,7 +11,9 @@ class GQCNN(object):
         # TODO: model dir as parameter
         # load gqcnn
         root_dir = '/media/sungwon/WorkSpace/projects/feature_space_analysis'
-        model_name = '2022-08-16-2023'
+        model_name = '2022-09-20-1315'
+        # model_name = '2022-09-19-2011'
+        # model_name = '2022-08-16-2023'
 
         spec = spec_from_file_location('model.GQCNN', os.path.join(root_dir, 'models', model_name, 'model.py'))
         module = module_from_spec(spec)
@@ -23,6 +25,7 @@ class GQCNN(object):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = module.GQCNN()
         self.model.load_state_dict(torch.load(os.path.join(root_dir, 'models', model_name, 'model.pt')))
+        # self.model.load_state_dict(torch.load(os.path.join(root_dir, 'models', model_name, 'model_ft.pt')))
         self.model.to(self.device)
 
         self.im_mean = np.load(os.path.join(root_dir, 'models', model_name, 'im_mean.npy'))
@@ -36,6 +39,11 @@ class GQCNN(object):
             self.model.merge_stream[-2].register_forward_hook(self.get_activation(self.activations, '(n-1)layer'))
         except:
             self.model.feature_fc_stack[-2].register_forward_hook(self.get_activation(self.activations, '(n-1)layer'))
+
+        # define optimizer and loss
+        self.loss_fn = torch.nn.CrossEntropyLoss()
+        params = list(self.model.merge_stream.parameters())
+        self.optimizer = torch.optim.Adam(params, lr=0.0005)
 
     @staticmethod
     def get_activation(activations, name):
@@ -73,6 +81,37 @@ class GQCNN(object):
 
         return q_value, feature
 
-    # TODO
     def fine_tune(self, image_tensor, pose_tensor, label_tensor):
-        raise NotImplementedError
+        # normalize image
+        image_tensor = (image_tensor - self.im_mean) / self.im_std
+        pose_tensor = (pose_tensor - self.pose_mean) / self.pose_std
+
+        # numpy to tensor
+        image_tensor = torch.from_numpy(image_tensor).to(self.device).view(-1, 1, 32, 32)
+        pose_tensor = torch.from_numpy(pose_tensor).to(self.device)
+        label_tensor = torch.from_numpy(label_tensor).to(self.device)
+
+        # train
+        output = self.model(image_tensor, pose_tensor)
+        loss = self.loss_fn(output, label_tensor)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return loss.item()
+
+
+if __name__ == '__main__':
+    gqcnn = GQCNN()
+    batch_size = 10
+    image_tensor = np.zeros((batch_size, 32, 32, 1), dtype=np.float32)
+    pose_tensor = np.zeros((batch_size, 1), dtype=np.float32)
+    label_tensor = np.zeros((batch_size, 2), dtype=np.float32)
+    label_tensor[:, 1] = 1
+
+    for i in range(100):
+        loss = gqcnn.fine_tune(image_tensor, pose_tensor, label_tensor)
+        print(loss)
+        print(gqcnn.model.merge_stream[0].weight)
+

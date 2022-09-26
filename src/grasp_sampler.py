@@ -159,15 +159,31 @@ class AntipodalGraspSampler(object):
         segmask_img = segmask_image.copy()
 
         # get edge using Laplacian with depth
-        depth_laplacian = cv2.Laplacian(depth_img, cv2.CV_64F, ksize=5)
+        segmask_img = segmask_img.astype('uint8')
+        depth_image_downsampled = cv2.resize(depth_img, (0, 0), fx=0.5, fy=0.5)
+        segmask_image_downsampled = cv2.resize(segmask_img, (0, 0), fx=0.5, fy=0.5)
+        depth_laplacian = cv2.Laplacian(depth_image_downsampled, cv2.CV_64F, ksize=5)
         depth_laplacian = np.abs(depth_laplacian)
-        depth_edge_image_laplacian = np.zeros(depth_img.shape).astype('uint8')
+        depth_edge_image_laplacian = np.zeros(depth_image_downsampled.shape).astype('uint8')
         depth_edge_image_laplacian[depth_laplacian > self.depth_laplacian_threshold] = 255
 
         # get edge pixels
-        edge_image = depth_edge_image_laplacian * segmask_img
+        edge_image = depth_edge_image_laplacian * segmask_image_downsampled
         edge_image[edge_image > 0] = 255
         edge_pixel_y, edge_pixel_x = np.where(edge_image == 255)
+        edge_pixel_y = edge_pixel_y * 2
+        edge_pixel_x = edge_pixel_x * 2
+
+        # # get edge using Laplacian with depth
+        # depth_laplacian = cv2.Laplacian(depth_img, cv2.CV_64F, ksize=5)
+        # depth_laplacian = np.abs(depth_laplacian)
+        # depth_edge_image_laplacian = np.zeros(depth_img.shape).astype('uint8')
+        # depth_edge_image_laplacian[depth_laplacian > self.depth_laplacian_threshold] = 255
+
+        # # get edge pixels
+        # edge_image = depth_edge_image_laplacian * segmask_img
+        # edge_image[edge_image > 0] = 255
+        # edge_pixel_y, edge_pixel_x = np.where(edge_image == 255)
 
         # get surface nomal using gradient
         grad_image = np.copy(depth_img)

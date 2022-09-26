@@ -20,7 +20,9 @@ from src.gqcnn import GQCNN
 from src.grasp_sampler import AntipodalGrasp, AntipodalGraspSampler
 from src.policy import (CrossEntropyGraspingPolicy,
                         PosteriorGraspingPolicy,
-                        CrossEntorpyPosteriorGraspingPolicy)
+                        CrossEntorpyPosteriorGraspingPolicy,
+                        RepeatSuccessGraspingPolicy,
+                        QLearningGraspingPolicy,)
 
 
 class SigulatePickingEnv(object):
@@ -42,8 +44,7 @@ class SigulatePickingEnv(object):
                 },
                 {
                     "name": "--save_results",
-                    "type": bool,
-                    "default": False,
+                    "action": 'store_true',
                     "help": "Save the results"
                 },
             ],
@@ -66,22 +67,41 @@ class SigulatePickingEnv(object):
         if policy_cfg["type"] == "posterior":
             self.policy = PosteriorGraspingPolicy(
                 gqcnn, sampler, policy_cfg)
+            self.num_update_features_per_step = policy_cfg["posterior"]["num_update_features_per_step"]
         elif policy_cfg["type"] == "cross_entropy":
             self.policy = CrossEntropyGraspingPolicy(
                 gqcnn, sampler, policy_cfg)
-        else:
-            policy_cfg["type"] = "cross_entropy_posterior"
+        elif policy_cfg["type"] == "cross_entropy_posterior":
             self.policy = CrossEntorpyPosteriorGraspingPolicy(
                 gqcnn, sampler, policy_cfg)
+            self.num_update_features_per_step = policy_cfg["cross_entropy_posterior"]["num_update_features_per_step"]
+        elif policy_cfg["type"] == "repeat_success":
+            self.policy = RepeatSuccessGraspingPolicy(
+                gqcnn, sampler, policy_cfg)
+        elif policy_cfg["type"] == "q_learning":
+            prior_gqcnn = GQCNN()
+            self.policy = QLearningGraspingPolicy(
+                gqcnn, prior_gqcnn, sampler, policy_cfg)
 
         # set up simulation
         self.dt = sim_cfg["dt"]
+        self.render_freq = 1/sim_cfg["render_freq"]
         self.num_main_iters = sim_cfg["num_main_iters"]
         self.num_sub_iters = sim_cfg["num_sub_iters"]
         self.target_object_name = sim_cfg["target_object"]
+        self.target_dataset_name = sim_cfg["target_dataset"]
         self.object_rand_pose_range = sim_cfg["object_random_pose_range"]
-        self.max_num_stable_pose = sim_cfg["max_num_stable_pose"]
-        self.min_stable_pose_prob = sim_cfg["min_stable_pose_prob"]
+        self.grasp_pose_z_offset = sim_cfg["grasp_pose_z_offset"]
+        self.gripper_width = sim_cfg["gripper_width"]
+
+        # choose simulation method
+        self.sim_method = sim_cfg['method']
+        if self.sim_method == 'multi_stable_pose':
+            self.min_stable_pose_prob = sim_cfg[self.sim_method]['min_stable_pose_prob']
+            self.max_num_stable_pose = sim_cfg[self.sim_method]['max_num_stable_pose']
+        elif self.sim_method == 'single_stable_pose':
+            self.stable_pose_idx = sim_cfg[self.sim_method]['stable_pose_idx']
+            self.max_num_stable_pose = sim_cfg[self.sim_method]['max_num_stable_pose']
 
         cx = sim_cfg["camera"]["phoxi"]["cx"]
         cy = sim_cfg["camera"]["phoxi"]["cy"]
@@ -97,12 +117,14 @@ class SigulatePickingEnv(object):
         self.save_dir = os.path.join(root_dir, self.target_object_name, policy_cfg["type"])
         if self.save_results:
             # create save directory
-            os.makedirs(self.save_dir, exist_ok=True)
             os.makedirs(os.path.join(self.save_dir, 'data'), exist_ok=True)
 
-            # save config files
-            with open(os.path.join(self.save_dir, 'config.yaml'), "w") as f:
-                yaml.safe_dump(cfg, f)
+        # save config files
+        os.makedirs(self.save_dir, exist_ok=True)
+        with open(os.path.join(self.save_dir, 'config.yaml'), "w") as f:
+            yaml.safe_dump(cfg, f)
+
+        # set up tensorboard
         self.writer = SummaryWriter(os.path.join(self.save_dir, 'logs'))
 
         # custom env variables
@@ -114,8 +136,8 @@ class SigulatePickingEnv(object):
 
         self.enable_viewer_sync = True
         self.task_status = None
-        self._frame_count = 0
         self.wait_timer = 0.0
+        self.render_timer = self.render_freq + self.dt
 
         # intialize sim
         self._create_sim()
@@ -125,7 +147,7 @@ class SigulatePickingEnv(object):
         self.gym.prepare_sim(
             self.sim)  # Prepares simulation with buffer allocations
 
-        # prepare some tensors
+        # metrics for tensorboard
         self.average_reward = np.zeros((self.num_sub_iters, self.num_envs), dtype=np.float32)
         self.average_q_value = np.zeros((self.num_sub_iters, self.num_envs), dtype=np.float32)
         self.average_posterior = np.zeros((self.num_sub_iters, self.num_envs), dtype=np.float32)
@@ -143,10 +165,10 @@ class SigulatePickingEnv(object):
 
         if self.args.physics_engine == gymapi.SIM_FLEX:
         # if self.args.physics_engine == gymapi.SIM_FLEX and not self.args.use_gpu_pipeline:
-            sim_params.substeps = 2
+            sim_params.substeps = 3
             sim_params.flex.solver_type = 5
-            sim_params.flex.num_outer_iterations = 5
-            sim_params.flex.num_inner_iterations = 10
+            sim_params.flex.num_outer_iterations = 4
+            sim_params.flex.num_inner_iterations = 20
             sim_params.flex.relaxation = 0.75
             sim_params.flex.warm_start = 0.8
             sim_params.flex.shape_collision_margin = 0.001
@@ -157,7 +179,7 @@ class SigulatePickingEnv(object):
             sim_params.stress_visualization_min = 0.0
             sim_params.stress_visualization_max = 1.e+5
         elif self.args.physics_engine == gymapi.SIM_PHYSX:
-            sim_params.substeps = 1
+            sim_params.substeps = 5
             sim_params.physx.solver_type = 4
             sim_params.physx.num_position_iterations = 4
             sim_params.physx.num_velocity_iterations = 1
@@ -251,7 +273,7 @@ class SigulatePickingEnv(object):
 
         # default hand dof state
         self.num_dofs = self.gym.get_asset_dof_count(hand_asset)
-        default_dof_pos = np.array([0.0, 0.0, hand_offset, 0.0, 0.04, 0.04], dtype=np.float32)
+        default_dof_pos = np.array([0.0, 0.0, hand_offset, 0.0, self.gripper_width/2.0, self.gripper_width/2.0], dtype=np.float32)
         default_dof_state = np.zeros(self.num_dofs, gymapi.DofState.dtype)
         default_dof_state["pos"] = default_dof_pos
 
@@ -268,7 +290,8 @@ class SigulatePickingEnv(object):
         # LOAD OBJ ASSET #
         ##################
         # load object asset
-        object_asset_file = "urdf/egad_eval_set_urdf/{}/{}.urdf".format(
+        object_asset_file = "urdf/{}/{}/{}.urdf".format(
+            self.target_dataset_name,
             self.target_object_name,
             self.target_object_name)
         asset_options = gymapi.AssetOptions()
@@ -276,7 +299,7 @@ class SigulatePickingEnv(object):
         asset_options.fix_base_link = False
         asset_options.thickness = 0.001
         asset_options.override_inertia = True
-        # asset_options.mesh_normal_mode = gymapi.COMPUTE_PER_VERTEX
+        asset_options.mesh_normal_mode = gymapi.COMPUTE_PER_VERTEX
         if self.args.physics_engine == gymapi.SIM_PHYSX:
             asset_options.vhacd_enabled = True
             asset_options.vhacd_params.resolution = 300000
@@ -286,13 +309,21 @@ class SigulatePickingEnv(object):
 
         # load object stable poses
         object_stable_prob = np.load(
-            "assets/urdf/egad_eval_set_urdf/{}/stable_prob.npy".format(
+            "assets/urdf/{}/{}/stable_prob.npy".format(
+                self.target_dataset_name,
                 self.target_object_name))
-        object_stable_prob = object_stable_prob[object_stable_prob > self.min_stable_pose_prob][:self.max_num_stable_pose]
-        self.object_stable_prob = object_stable_prob / np.sum(object_stable_prob)
         object_stable_poses = np.load(
-            "assets/urdf/egad_eval_set_urdf/{}/stable_poses.npy".format(
-                self.target_object_name))[:len(object_stable_prob)]
+            "assets/urdf/{}/{}/stable_poses.npy".format(
+                self.target_dataset_name,
+                self.target_object_name))
+        if self.sim_method == "multi_stable_pose":
+            object_stable_prob = object_stable_prob[object_stable_prob > self.min_stable_pose_prob][:self.max_num_stable_pose]
+            self.object_stable_prob = object_stable_prob / np.sum(object_stable_prob)
+            object_stable_poses = object_stable_poses[:len(object_stable_prob)]
+        elif self.sim_method == "single_stable_pose":
+            object_stable_poses = [object_stable_poses[self.stable_pose_idx]] * self.max_num_stable_pose
+            self.object_stable_prob = np.ones(len(object_stable_poses)) / self.max_num_stable_pose
+
         self.object_stable_poses = []
         for pose in object_stable_poses:
             # 4x4 transform matrix to gymapi.Transform
@@ -396,10 +427,17 @@ class SigulatePickingEnv(object):
 
             # step graphics
             if self.enable_viewer_sync:
-                self.gym.step_graphics(self.sim)
-                self.gym.draw_viewer(self.viewer, self.sim, True)
-                self.gym.sync_frame_time(self.sim)
+                if self.render_timer > self.render_freq:
+                    self.gym.step_graphics(self.sim)
+                    self.gym.draw_viewer(self.viewer, self.sim, True)
+                    # self.gym.sync_frame_time(self.sim)
+                    self.render_timer = 0
+                else:
+                    self.gym.step_graphics(self.sim)
+                    self.gym.poll_viewer_events(self.viewer)
+                    self.render_timer += self.dt
             else:
+                self.gym.step_graphics(self.sim)
                 self.gym.poll_viewer_events(self.viewer)
 
         # step graphics for offscreen rendering
@@ -478,19 +516,27 @@ class SigulatePickingEnv(object):
         # convert antipodal grasp to 3d grasp
         grasp_poses = self.convert_to_grasp_pose(grasps)
 
+        # restore previous successful grasp
+        if isinstance(self.policy, RepeatSuccessGraspingPolicy):
+            grasp_poses = self.policy.restore_grasps(grasp_poses, object_poses)
+
         # visualize grasps
         grasp_contact_points = self.get_grasp_pose_on_object(grasp_poses, object_poses)
 
         # execute grasp
-        self.execute_grasp(grasp_poses)
+        if self.args.physics_engine == gymapi.SIM_PHYSX:
+            self.execute_grasp_physx(grasp_poses)
+        else:
+            self.execute_grasp_flex(grasp_poses)
 
         # evaluate grasp
         rewards = self.evaluate_grasp()
 
-        # update likelihood per main step
-        if sub_step == 0:
+        # update per main step
+        if sub_step == self.num_sub_iters - 1:
             # update likelihood
-            if isinstance(self.policy, PosteriorGraspingPolicy):
+            if isinstance(self.policy, PosteriorGraspingPolicy) or \
+               isinstance(self.policy, CrossEntorpyPosteriorGraspingPolicy):
                 # get valid indices
                 valid_indices = []
                 for env_idx in range(self.num_envs):
@@ -499,20 +545,28 @@ class SigulatePickingEnv(object):
                 valid_indices = np.array(valid_indices, dtype=np.int32)
 
                 # get update based on stable pose probability
+                num_samples = min(self.num_update_features_per_step, len(valid_indices))
                 prob = self.object_stable_prob[valid_indices]
                 prob /= np.sum(prob)
                 update_idx = np.random.choice(
                     valid_indices,
-                    size=1,
-                    p=prob)
+                    size=num_samples,
+                    p=prob,
+                    replace=False)
                 self.policy.update(features[update_idx], rewards[update_idx])
 
                 # save update history
                 if self.save_results:
                     np.save(os.path.join(self.save_dir, 'data', 'updated_feature_{:03d}_{:02d}.npy'.format(main_step, sub_step)), features[update_idx])
                     np.save(os.path.join(self.save_dir, 'data', 'updated_reward_{:03d}_{:02d}.npy'.format(main_step, sub_step)), rewards[update_idx])
-            elif isinstance(self.policy, CrossEntorpyPosteriorGraspingPolicy):
-                pass
+
+            # update previous successful grasp for repeat success policy
+            if isinstance(self.policy, RepeatSuccessGraspingPolicy):
+                self.policy.update(grasp_contact_points, rewards)
+
+            # update for q-learning policy
+            if isinstance(self.policy, QLearningGraspingPolicy):
+                self.policy.update(im_tensors, depth_tensors, rewards)
 
         # print result
         self.average_reward[sub_step, :] = rewards
@@ -536,7 +590,6 @@ class SigulatePickingEnv(object):
             print('main_step: {:03d}, E[r]: {:.3f}, E[q]: {:.3f}, E[p]: {:.3f}'.format(
                 main_step, average_reward, average_q_value, average_posterior))
 
-
         # save data
         if self.save_results:
             np.save(os.path.join(self.save_dir, 'data', 'q_values_{:03d}_{:02d}.npy'.format(main_step, sub_step)), q_values)
@@ -545,6 +598,10 @@ class SigulatePickingEnv(object):
             np.save(os.path.join(self.save_dir, 'data', 'features_{:03d}_{:02d}.npy'.format(main_step, sub_step)), features)
             np.save(os.path.join(self.save_dir, 'data', 'rewards_{:03d}_{:02d}.npy'.format(main_step, sub_step)), rewards)
             np.save(os.path.join(self.save_dir, 'data', 'grasp_contact_points_{:03d}_{:02d}.npy'.format(main_step, sub_step)), grasp_contact_points)
+            np.save(os.path.join(self.save_dir, 'data', 'posteriors_{:03d}_{:02d}.npy'.format(main_step, sub_step)), posteriors)
+            if isinstance(self.policy, QLearningGraspingPolicy):
+                if main_step == 99:
+                    self.policy.save(os.path.join(self.save_dir, 'model_{:03d}_{:02d}.pt'.format(main_step, sub_step)))
         return None
 
     ############################################
@@ -600,6 +657,7 @@ class SigulatePickingEnv(object):
                 elif grasp_theta < -np.pi/2:
                     grasp_theta += np.pi
                 grasp_pose = np.array([grasp_pose_world[0, 3], grasp_pose_world[1, 3], grasp_pose_world[2, 3], grasp_theta], dtype=np.float32)
+                grasp_pose[2] += self.grasp_pose_z_offset
             else:
                 grasp_pose = np.array([0, 0, 0.5, 0], dtype=np.float32)
             grasp_poses.append(grasp_pose)
@@ -629,8 +687,10 @@ class SigulatePickingEnv(object):
             cp2_offset = -cp1_offset
 
             cp1 = center + cp1_offset
+            cp1[2] -= self.grasp_pose_z_offset
             cp1 = gymapi.Vec3(cp1[0], cp1[1], cp1[2])
             cp2 = center + cp2_offset
+            cp2[2] -= self.grasp_pose_z_offset
             cp2 = gymapi.Vec3(cp2[0], cp2[1], cp2[2])
             color = gymapi.Vec3(1.0, 0.0, 0.0)
 
@@ -653,7 +713,39 @@ class SigulatePickingEnv(object):
         self.wait(self.dt)
         return grasp_contact_points
 
-    def execute_grasp(self, grasp_poses):
+    def execute_grasp_physx(self, grasp_poses):
+        """Execute grasp in simulation
+
+        Args:
+            grasp_poses (numpy.ndarray): grasp poses in world frame. (num_envs, (x, y, z, theta))
+        """
+        # 1) execute x, y, theta movement
+        xyt_idx = [0, 1, 3]
+        self.target_dof_pos[:, xyt_idx] = grasp_poses[:, xyt_idx]
+        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.target_dof_pos))
+        self.wait(5.0)
+
+        # 2) execute z movement
+        self.target_dof_pos[:, 2] = grasp_poses[:, 2]
+        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.target_dof_pos))
+        self.wait(5.0)
+
+        # 3) execute grasp
+        self.target_dof_pos[:, 4:] = 0.0
+        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.target_dof_pos))
+        self.wait(5.0)
+
+        # 4) enable gravity on objects and execute lift
+        self.target_dof_pos[:, 2] = 0.5
+        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.target_dof_pos))
+        # enable gravity
+        for env_idx in range(self.num_envs):
+            obj_props = self.gym.get_actor_rigid_body_properties(self.envs[env_idx], self.object_handles[env_idx])
+            obj_props[0].flags = gymapi.RIGID_BODY_NONE
+            self.gym.set_actor_rigid_body_properties(self.envs[env_idx], self.object_handles[env_idx], obj_props, False)
+        self.wait(5.0)
+
+    def execute_grasp_flex(self, grasp_poses):
         """Execute grasp in simulation
 
         Args:
@@ -683,7 +775,7 @@ class SigulatePickingEnv(object):
             obj_props = self.gym.get_actor_rigid_body_properties(self.envs[env_idx], self.object_handles[env_idx])
             obj_props[0].flags = gymapi.RIGID_BODY_NONE
             self.gym.set_actor_rigid_body_properties(self.envs[env_idx], self.object_handles[env_idx], obj_props, False)
-        self.wait(5.0)
+        self.wait(2.0)
 
     def visualize_camera_axis(self):
         """Visualize camera axis"""
@@ -741,4 +833,7 @@ if __name__ == '__main__':
         for j in range(env.num_sub_iters):
             start_time = time.time()
             env.step(i, j)
+            # if i == 0:
+            #     env.reset_env()
+            # env.wait(2.0)
             print('[{}][{}] step time: {:.3f}'.format(i, j, time.time() - start_time))

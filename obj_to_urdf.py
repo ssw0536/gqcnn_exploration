@@ -76,7 +76,6 @@ def obj_to_urdf(mesh_file):
 
     # mm to m and set mass 0.05kg
     mass = 0.050
-    mesh.apply_scale(0.001)
     mesh.vertices -= mesh.center_mass
     mesh.density = mass/mesh.volume
 

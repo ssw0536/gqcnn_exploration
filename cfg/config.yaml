@@ -1,12 +1,25 @@
 simulation:
   dt: 0.01
-  num_main_iters: 300
-  num_sub_iters: 10
+  render_freq: 10
+  num_main_iters: 1000
+  num_sub_iters: 1
 
-  target_object: B3
+  target_dataset: adv_obj_urdf
+  target_object: gearbox
+  # target_dataset: egad_eval_set_urdf
+  # target_dataset: egad_eval_set_urdf
+  # target_object: G2
   object_random_pose_range: 0.1
-  max_num_stable_pose: 50
-  min_stable_pose_prob: 0.01
+  grasp_pose_z_offset: -0.005
+  gripper_width: 0.05
+
+  method: multi_stable_pose
+  single_stable_pose:
+    stable_pose_idx: 1
+    max_num_stable_pose: 20
+  multi_stable_pose:
+    min_stable_pose_prob: 0.01
+    max_num_stable_pose: 50
 
   camera:
     phoxi:
@@ -22,33 +35,73 @@ simulation:
       cy: 193.0
 
 policy:
-  type: posterior
+  type: q_learning
 
   posterior:
-    prior_strength: 5.0
-    cosine_similarity_threshold: 0.95
+    prior_strength: 2.0
+    prior_discouraging_coef: 1.0
+    likelihood_strength: 1.0
+    cosine_similarity_threshold: 0.95  # 0.9
     buffer_size: inf
     feature_dim: 128
+    num_update_features_per_step: 100
 
   cross_entropy:
-    num_seed_samples: 128
-    num_gmm_samples: 64
+    num_seed_samples: 256
+    num_gmm_samples: 128
+    num_iters: 3
+    gmm_refit_p: 0.25
+    gmm_component_frac: 0.4
+    gmm_reg_covar: 0.01
+    feature_dim: 128
+
+  cross_entropy_posterior:
+    # posteriors
+    prior_strength: 2.0
+    prior_discouraging_coef: 1.0  # 0.5
+    likelihood_strength: 1.0  # 5.0
+    cosine_similarity_threshold: 0.95  # 0.9
+    buffer_size: inf
+    feature_dim: 128
+    num_update_features_per_step: 100  # 1
+    random_sample: False
+
+    # CEM
+    num_seed_samples: 256
+    num_gmm_samples: 128
     num_iters: 3
     gmm_refit_p: 0.25
     gmm_component_frac: 0.4
     gmm_reg_covar: 0.01
 
-  cross_entorpy_posterior:
-    test2: 2
+  repeat_success:
+    no_data: no_data
+
+  q_learning:
+    # CEM
+    num_seed_samples: 256
+    num_gmm_samples: 128
+    num_iters: 3
+    gmm_refit_p: 0.25
+    gmm_component_frac: 0.4
+    gmm_reg_covar: 0.01
+    feature_dim: 128
+
+    # Q-Learning
+    learning_rate: 0.001
+    target_update_interval: 8
+    mini_epochs: 8
+    batch_size: 128
+    buffer_size: 128
 
 sampling:
   # antipodality
-  max_gripper_width: 0.08  # TODO: need camera matrix
-  depth_laplacian_threshold: 0.04
-  antipodal_threshold_angle: 10
-  max_num_sample: 1000
+  max_gripper_width: 0.05  # TODO: need camera matrix
+  depth_laplacian_threshold: 0.02
+  antipodal_threshold_angle: 45
+  max_num_sample: 2000
 
   # depth
-  num_depth_sample: 5
+  num_depth_sample: 10
   depth_offset_min: 0.015
   depth_offset_max: 0.05
