@@ -114,4 +114,3 @@ if __name__ == '__main__':
         loss = gqcnn.fine_tune(image_tensor, pose_tensor, label_tensor)
         print(loss)
         print(gqcnn.model.merge_stream[0].weight)
-

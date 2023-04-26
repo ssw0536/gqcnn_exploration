@@ -230,6 +230,8 @@ class AntipodalGraspSampler(object):
             ((axis_vector * unit_normals[pair2]).sum(axis=1) < np.cos(threshold_deg*np.pi/180.0))
             )[0]
 
+        print("Number of candidates: {}".format(len(candidate_index)))
+
         # random sampling from the antipodal candidate grasps
         grasp_candidates = []
         if candidate_index.shape[0] < self.max_num_sample:

@@ -491,8 +491,10 @@ class CrossEntorpyPosteriorGraspingPolicy(object):
         if self.buffer_size == 'inf':
             self.buffer_size = np.inf
 
-        self.feature_history = np.zeros((0, self.feature_dim))
-        self.reward_history = np.zeros((0, 1))
+        # self.feature_history = np.zeros((0, self.feature_dim))
+        # self.reward_history = np.zeros((0, 1))
+        self.feature_history = np.load('feature_history.npy')
+        self.reward_history = np.load('reward_history.npy')
 
     def update(self, feature, reward):
         """Update the posterior policy.
@@ -501,6 +503,7 @@ class CrossEntorpyPosteriorGraspingPolicy(object):
             feature (numpy.ndarray): (N, self.feature_dim) feature vector.
             reward (numpy.ndarray): (N, 1) reward.
         """
+        return
         if len(np.shape(feature)) == 1:
             feature = np.expand_dims(feature, axis=0)
             reward = np.expand_dims(reward, axis=0)
@@ -822,6 +825,131 @@ class CrossEntorpyPosteriorGraspingPolicy(object):
             best_depth_tensors,
             best_features,
             best_posteriors)
+
+
+class RepeatSuccessGraspingPolicy(object):
+    def __init__(self, model, sampler, config):
+        self.model = model
+        self.sampler = sampler
+
+        # parameters
+        self.stored_grasp_indices = []
+        self.stored_grasp_contact_points = None
+
+    def action(self, depth_images, segmasks, verbose=False):
+        batch_size = depth_images.shape[0]
+
+        # get antipodal grasps from  depth images
+        start_time = time.time()
+        grasp_candidates = []
+        for i in range(batch_size):
+            grasp_candidates.append(self.sampler.sample(depth_images[i], segmasks[i]))
+        if verbose:
+            print('Get antipodal grasp time: {:.2f}s'.format(time.time() - start_time))
+
+        # get grasp candidates
+        start_time = time.time()
+        im_tensors, depth_tensors = [], []
+        grasp_to_tensor(depth_images[0], grasp_candidates[0])
+        with Pool(12) as p:
+            temp = p.starmap(grasp_to_tensor, zip(depth_images, grasp_candidates))
+        for i in range(len(temp)):
+            im_tensors.append(temp[i][0])
+            depth_tensors.append(temp[i][1])
+        if verbose:
+            print('Convert grasp to tensor time: {:.2f}s'.format(time.time() - start_time))
+
+        # get grasp quality
+        start_time = time.time()
+        features, q_values = [], []
+        with torch.no_grad():
+            for im_tensor, depth_tensor in zip(im_tensors, depth_tensors):
+                q_value, feature = self.model(im_tensor, depth_tensor)
+                features.append(feature)
+                q_values.append(q_value)
+        if verbose:
+            print('GQ-CNN inference time: {:.2f}s'.format(time.time() - start_time))
+
+        # get best grasp index
+        best_grasps = []
+        best_q_values = []
+        best_im_tensors = []
+        best_depth_tensors = []
+        best_features = []
+        best_posteriors = []
+        for i in range(batch_size):
+            if len(im_tensors[i]) == 0:
+                best_grasps.append(None)
+                best_q_values.append(0)
+                best_im_tensors.append(np.zeros((32, 32, 1)))
+                best_depth_tensors.append(np.zeros((1,)))
+                best_features.append(np.zeros((self.feature_dim,)))
+                best_posteriors.append(0)
+            else:
+                best_index = np.argmax(q_values[i])
+                best_grasps.append(grasp_candidates[i][best_index])
+                best_q_values.append(q_values[i][best_index])
+                best_im_tensors.append(im_tensors[i][best_index])
+                best_depth_tensors.append(depth_tensors[i][best_index])
+                best_features.append(features[i][best_index])
+                best_posteriors.append(0)
+        return (
+            best_grasps,
+            best_q_values,
+            best_im_tensors,
+            best_depth_tensors,
+            best_features,
+            best_posteriors)
+
+    def update(self, grasp_contact_points, rewards):
+        success_indices = np.where(rewards > 0)[0]
+        for i in success_indices:
+            if i in self.stored_grasp_indices:
+                continue
+            self.stored_grasp_contact_points[i] = grasp_contact_points[i]
+            self.stored_grasp_indices = success_indices
+
+    def restore_grasps(self, grasp_poses, object_poses):
+        # get environment size
+        env_size = len(grasp_poses)
+
+        # TODO: device to some where
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # initialize
+        if self.stored_grasp_contact_points is None:
+            self.stored_grasp_contact_points = np.zeros((env_size, 2, 3))
+
+        # restore grasp poses
+        for env_idx in range(env_size):
+            if env_idx in self.stored_grasp_indices:
+                # transform stored grasp to current object pose
+                t_wo = object_poses[env_idx]
+                cp1 = self.stored_grasp_contact_points[env_idx, 0, :]
+                cp2 = self.stored_grasp_contact_points[env_idx, 1, :]
+                cp1 = gymapi.Vec3(cp1[0], cp1[1], cp1[2])
+                cp2 = gymapi.Vec3(cp2[0], cp2[1], cp2[2])
+                cp1 = t_wo.transform_point(cp1)
+                cp2 = t_wo.transform_point(cp2)
+
+                # convert to numpy
+                cp1 = np.array([cp1.x, cp1.y, cp1.z], dtype=np.float32)
+                cp2 = np.array([cp2.x, cp2.y, cp2.z], dtype=np.float32)
+
+                # get grasp pose
+                grasp_pose = np.zeros(4, dtype=np.float32)
+                grasp_pose[0:3] = (cp1 + cp2) / 2
+                grasp_theta = np.arctan2(cp2[0] - cp1[0], cp2[1] - cp1[1])
+                if grasp_theta > np.pi/2:
+                    grasp_theta -= np.pi
+                elif grasp_theta < -np.pi/2:
+                    grasp_theta += np.pi
+                grasp_pose[3] = grasp_theta
+
+                # restore grasp
+                grasp_pose = torch.from_numpy(grasp_pose).to(device)
+                grasp_poses[env_idx] = grasp_pose
+        return grasp_poses
 
 
 class QLearningGraspingPolicy(object):

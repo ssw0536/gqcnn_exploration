@@ -1,14 +1,13 @@
 simulation:
   dt: 0.01
-  render_freq: 10
+  render_freq: 10000
   num_main_iters: 1000
   num_sub_iters: 1
 
   target_dataset: adv_obj_urdf
   target_object: gearbox
   # target_dataset: egad_eval_set_urdf
-  # target_dataset: egad_eval_set_urdf
-  # target_object: G2
+  # target_object: E2
   object_random_pose_range: 0.1
   grasp_pose_z_offset: -0.005
   gripper_width: 0.05
@@ -19,7 +18,7 @@ simulation:
     max_num_stable_pose: 20
   multi_stable_pose:
     min_stable_pose_prob: 0.01
-    max_num_stable_pose: 50
+    max_num_stable_pose: 1  # 50
 
   camera:
     phoxi:
@@ -34,8 +33,12 @@ simulation:
       cx: 258.0
       cy: 193.0
 
+grasp_metric:
+  # options: analytic, physx, flex
+  type: flex
+
 policy:
-  type: q_learning
+  type: posterior
 
   posterior:
     prior_strength: 2.0
@@ -73,9 +76,6 @@ policy:
     gmm_refit_p: 0.25
     gmm_component_frac: 0.4
     gmm_reg_covar: 0.01
-
-  repeat_success:
-    no_data: no_data
 
   q_learning:
     # CEM
