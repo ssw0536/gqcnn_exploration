@@ -177,3 +177,5 @@ test
 assets/urdf/ycb/
 assets/urdf/egad_eval_set_urdf/
 !assets/urdf/franka_description/
+data/
+run_history/

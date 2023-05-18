@@ -1,0 +1,27 @@
+simulation:
+  dt: 0.01
+  sync_frame_time: False
+
+camera:
+  phoxi:
+    fx: 552.5  # 525
+    fy: 552.5  # 525
+    cx: 255.5  # 320
+    cy: 191.75  # 240
+    w: 516
+    h: 386
+
+  primesense:
+    fx: 525.0  # 552.5
+    fy: 525.0  # 552.5
+    cx: 319.5  # 258.0
+    cy: 239.5  # 193.0
+    w: 640
+    h: 480
+
+bin:
+  size: [0.4, 0.5, 0.3]
+
+experiment:
+  num_episode: 1000
+  max_trial: 100

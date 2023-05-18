@@ -1,17 +1,24 @@
-import copy
+from multiprocessing import Pool
+
+import time
 import numpy as np
 import trimesh
+import matplotlib.pyplot as plt
 from scipy.spatial import ConvexHull
 import cvxopt
 cvxopt.solvers.options['show_progress'] = False
 
+from .suction_model import suction_cup_lib as sclib
+from .suction_model import suction_cup_logic as scl
 
-class ContactPoint(object):
-    def __init__(self, contact_point, contact_normal, contact_tangent,
+
+class RigidContactPoint(object):
+    def __init__(self, center_of_mass, contact_point, contact_normal, contact_tangent,
                  friction_coef, num_edges, finger_radius, torque_scale):
         """Contact information for a single contact point.
 
         Args:
+            center_of_mass (np.ndarray): (x, y, z) location of center of mass.
             contact_point (np.ndarray): (x, y, z) location of contact point.
             contact_normal (np.ndarray): (x, y, z) normal vector of contact point. Direction should be inward.
             contact_tangent (np.ndarray): (x, y, z) tangent vector of contact point.
@@ -20,6 +27,7 @@ class ContactPoint(object):
             finger_radius (float): radius of finger to compute soft finger contact.
             torque_scale (float): scale factor for torque.
         """
+        self.center_of_mass = center_of_mass
         self.contact_point = contact_point
         self.contact_noraml = contact_normal / np.linalg.norm(contact_normal)
         self.contact_tangent = contact_tangent / np.linalg.norm(contact_tangent)
@@ -56,7 +64,9 @@ class ContactPoint(object):
         Returns:
             np.ndarray: (num_edges, 3) torque at contact point.
         """
-        t = np.cross(self.contact_point, self.friction_cone)
+        t = np.cross(
+            self.contact_point - self.center_of_mass,
+            self.friction_cone)
         t *= self.torque_scale
         return t
 
@@ -79,12 +89,29 @@ class ContactPoint(object):
         Returns:
             np.ndarray: (num_edges+2, 6) primitive wrenches. The last two wrenches are for torsion.
         """
-        wrenches = np.zeros((self.num_edges+2, 6))
+        wrenches = np.zeros((self.num_edges + 2, 6))
         wrenches[:self.num_edges, :3] = self.friction_cone
         wrenches[:self.num_edges, 3:] = self.torque
         wrenches[self.num_edges, 3:] = self.torsion
-        wrenches[self.num_edges+1, 3:] = -self.torsion
+        wrenches[self.num_edges + 1, 3:] = -self.torsion
         return wrenches
+
+    def friction_cone_geomtery(self, scale=0.01):
+        """Get friction cone geometry.
+
+        Args:
+            scale (float, optional): scale factor for friction cone. Defaults to 0.01.
+
+        Returns:
+            trimesh.path.Path3D: friction cone geometry.
+        """
+        friction_cone_lines = []
+        for primitive_wrench in self.friction_cone:
+            friction_cone_lines.append(
+                [self.contact_point,
+                 self.contact_point - primitive_wrench * scale])
+        friction_cone_lines = trimesh.load_path(friction_cone_lines)
+        return friction_cone_lines
 
 
 class GraspQaulity(object):
@@ -153,35 +180,22 @@ class GraspQaulity(object):
 
 class ParallelJawGraspMetric(object):
     # constant parameters
-    num_edges = None
-    finger_radius = None
-    torque_scale = None
-    gripper_width = None
-    quality_method = None
-
-    def __init__(self, contact_points):
-        # check params are set
-        self._check_params()
-        self._contact_points = contact_points
-
-    def _check_params(self):
-        assert self.num_edges is not None
-        assert self.finger_radius is not None
-        assert self.torque_scale is not None
-        assert self.gripper_width is not None
-        assert self.quality_method is not None
-
-    def quality(self):
-        if self._contact_points is None:
-            return 0.0
-
-        if self.quality_method == 'ferrari_canny_l1':
-            return GraspQaulity.ferrari_canny_l1(self._contact_points)
-        else:
-            raise NotImplementedError
+    num_edges = 8
+    finger_radius = 0.005
+    torque_scale = 1000.0
+    gripper_width = 0.085
+    quality_method = 'ferrari_canny_l1'
 
     @staticmethod
-    def from_mesh(mesh, grasp_pose, friction_coef):
+    def _check_params():
+        assert ParallelJawGraspMetric.num_edges is not None
+        assert ParallelJawGraspMetric.finger_radius is not None
+        assert ParallelJawGraspMetric.torque_scale is not None
+        assert ParallelJawGraspMetric.gripper_width is not None
+        assert ParallelJawGraspMetric.quality_method is not None
+
+    @staticmethod
+    def compute(mesh, grasp_pose, friction_coef, visualize=False, verbose=False):
         """Get the parallel jaw contact wrenches from a mesh and a grasp pose.
 
         Args:
@@ -189,20 +203,27 @@ class ParallelJawGraspMetric(object):
             grasp_pose (np.ndarray): 4x4 grasp pose in object frame. Grasp approach
                 direction should be along the z-axis. Grasp axis should be along the x-axis.
             friction_coef (float): friction coefficient.
+            visualize (bool): whether to visualize the contact wrenches.
+            verbose (bool): whether to print debug information.
 
         Returns:
-            obj::ParallelJawContact: Parallel jaw contact wrenches.
+            float: grasp quality. None if the grasp is not feasible.
+            list of ContactPoint: contact points. None if the grasp is not feasible.
         """
+        # check params
+        ParallelJawGraspMetric._check_params()
+
         # get params
         gripper_width = ParallelJawGraspMetric.gripper_width
         finger_radius = ParallelJawGraspMetric.finger_radius
         num_edges = ParallelJawGraspMetric.num_edges
         torque_scale = ParallelJawGraspMetric.torque_scale
+        quality_method = ParallelJawGraspMetric.quality_method
 
         # smooth mesh
-        mesh = copy.deepcopy(mesh)
-        mesh = trimesh.smoothing.filter_humphrey(mesh, alpha=0.5, beta=0.5, iterations=10)
-        assert isinstance(mesh, trimesh.Trimesh)
+        # mesh = copy.deepcopy(mesh)
+        # mesh = trimesh.smoothing.filter_humphrey(mesh, alpha=0.5, beta=0.5, iterations=10)
+        # assert isinstance(mesh, trimesh.Trimesh)
 
         # get grasp pose
         grasp_center = grasp_pose[:3, 3]
@@ -217,7 +238,7 @@ class ParallelJawGraspMetric(object):
         endpoint2 = grasp_center + grasp_axis * gripper_width / 2
 
         # visualize for debug
-        if False:
+        if visualize is True:
             grasp_line = np.stack([endpoint1, endpoint2], axis=0)
             grasp_line = trimesh.load_path(grasp_line)
             geometry = [mesh, grasp_line]
@@ -230,8 +251,9 @@ class ParallelJawGraspMetric(object):
             ray_origins=ray_origin,
             ray_directions=ray_direction)  # (2,)
         if np.any(is_collision):
-            print('collision before closing the gripper')
-            return ParallelJawGraspMetric(None)
+            if verbose:
+                print('collision before closing the gripper')
+            return (None, None)
 
         # close the gripper and get contact points
         ray_origin = np.stack([endpoint1, endpoint2], axis=0)
@@ -248,18 +270,25 @@ class ParallelJawGraspMetric(object):
                 [cp_ray_origin],
                 [cp_ray_direction])
             if len(cp_loc) == 0:
-                print('no contact point found while closing the gripper')
-                return ParallelJawGraspMetric(None)
+                if verbose:
+                    print('no contact point found while closing the gripper')
+                return (None, None)
 
             dist = np.linalg.norm(cp_loc - cp_ray_origin, axis=1)
+
+            if np.min(dist) > gripper_width / 2:
+                if verbose:
+                    print('no contact point found while closing the gripper')
+                return (None, None)
             intersect_first_idx = np.argmin(dist)
+
             cp_loc = cp_loc[intersect_first_idx]
             cp_tri_idx = cp_tri_idx[intersect_first_idx]
             cp_normal = -mesh.face_normals[cp_tri_idx]
-            print('cp_normal: ', cp_normal)
             cp_tangent = mesh.triangles[cp_tri_idx][0] - mesh.triangles[cp_tri_idx][1]
             cp_tangent /= np.linalg.norm(cp_tangent)
-            cp = ContactPoint(
+            cp = RigidContactPoint(
+                center_of_mass=mesh.center_mass,
                 contact_point=cp_loc,
                 contact_normal=cp_normal,
                 contact_tangent=cp_tangent,
@@ -270,7 +299,7 @@ class ParallelJawGraspMetric(object):
             contact_poinsts.append(cp)
 
         # visualize for debug
-        if True:
+        if visualize is True:
             grasp_line = np.stack([endpoint1, endpoint2], axis=0)
             grasp_line = trimesh.load_path(grasp_line)
 
@@ -284,4 +313,140 @@ class ParallelJawGraspMetric(object):
             geometry = [mesh, grasp_line, friction_cone_lines]
             trimesh.Scene(geometry=geometry).show(smooth=False)
 
-        return ParallelJawGraspMetric(contact_poinsts)
+        if quality_method == 'ferrari_canny_l1':
+            quality = GraspQaulity.ferrari_canny_l1(contact_poinsts)
+
+        return (quality, contact_poinsts)
+
+
+def evaluate_pj_grasp(grasp_pose, meshes, mesh_poses):
+    """Evaluate grasp quality for a parallel-jaw gripper on the scene.
+
+    Args:
+        grasp_pose (np.ndarray): 4x4 homogenous matrix of the grasp pose.
+        meshes (list of trimesh.Trimesh): meshes to be evaluated.
+        mesh_poses (np.ndarray): 4x4 homogenous matrix of the mesh poses.
+
+    Returns:
+        int: index of the target mesh
+        float: grasp success
+    """
+    # get 3 close mesh from grasp pose
+    mesh_pose_xyz = mesh_poses[:, :3, 3]
+    grasp_pose_xyz = grasp_pose[:3, 3]
+    dist = np.linalg.norm(mesh_pose_xyz - grasp_pose_xyz, axis=1)
+    near_indices = np.argsort(dist)[:3]
+
+    # meshes is list of trimesh.Trimesh
+    # gather meshes with near_indices
+    meshes = [meshes[i] for i in near_indices]
+    mesh_poses = mesh_poses[near_indices]
+
+    # gather inputs for parallel processing
+    input_tuple = []
+    for mesh, mesh_pose in zip(meshes, mesh_poses):
+        grasp_pose_object = np.linalg.inv(mesh_pose) @ grasp_pose
+        input_tuple.append((mesh, grasp_pose_object, 1.0, False, False))
+
+    # parallel processing for grasp quality evaluation
+    with Pool(3) as p:
+        output = p.starmap(ParallelJawGraspMetric.compute, input_tuple)
+
+    # gather outputs
+    quality = []
+    for q, _ in output:
+        if q is None:
+            quality.append(0.0)
+        else:
+            quality.append(q)
+
+    # all quality is 0.0, return the first mesh
+    if np.count_nonzero(quality) == 0:
+        return near_indices[0], 0.0
+
+    # get the best quality
+    quality = quality[np.argmax(quality)]
+    target_mesh_idx = near_indices[np.argmax(quality)]
+    if quality > 0.002:
+        return target_mesh_idx, 1.0
+    else:
+        return target_mesh_idx, 0.0
+
+
+def evaluate_sc_grasp(grasp_pose, meshes, mesh_poses, visualize=False):
+    """Evaluate grasp quality for a suction-cup gripper on the scene.
+
+    Args:
+        grasp_pose (np.ndarray): 4x4 homogenous matrix of the grasp pose.
+        meshes (trimesh.Trimesh): meshes to be evaluated.
+        mesh_poses (np.ndarray): 4x4 homogenous matrix of the mesh poses.
+
+    Returns:
+        int : target mesh index.
+        float: grasp success.
+    """
+    # get 3 close mesh from grasp pose
+    mesh_pose_xyz = mesh_poses[:, :3, 3]
+    grasp_pose_xyz = grasp_pose[:3, 3]
+    dist = np.linalg.norm(mesh_pose_xyz - grasp_pose_xyz, axis=1)
+    near_indices = np.argsort(dist)[:3]
+
+    # meshes is list of trimesh.Trimesh
+    # gather meshes with near_indices
+    meshes = [meshes[i] for i in near_indices]
+    mesh_poses = mesh_poses[near_indices]
+
+    # gather inputs for parallel processing
+    input_tuple = []
+    for mesh, mesh_pose in zip(meshes, mesh_poses):
+        grasp_pose_object = np.linalg.inv(mesh_pose) @ grasp_pose
+        input_tuple.append((mesh, [grasp_pose_object[:3, 3]]))
+
+    # get target mesh
+    with Pool(3) as p:
+        output = p.starmap(trimesh.proximity.closest_point, input_tuple)
+    contact_points = np.array([o[0] for o in output])
+    dists = np.array([o[1][0] for o in output])
+    target_mesh_idx = near_indices[np.argmin(dists)]
+
+    # gather inputs for grasp quality evaluation
+    contact_point = contact_points[np.argmin(dists)][0] * 1000.0  # convert to mm
+
+    obj_model = sclib.ModelData(
+        mesh=meshes[np.argmin(dists)],
+        units=("meters", "millimeters"),
+        subdivide=True)
+
+    grasp_pose_object = np.linalg.inv(mesh_poses[np.argmin(dists)]) @ grasp_pose
+    approach_vector = grasp_pose_object[:3, 0]
+
+    # evaluate grasp quality
+    contact_seal = scl.contact_test_seal(
+        con_p=contact_point,
+        obj_model=obj_model,
+        a_v=approach_vector,
+        noise_samples=0)
+
+    # get score
+    if contact_seal[2] is None:
+        score = 0.0
+    else:
+        score = contact_seal[1]
+
+    # visualize for debug
+    if visualize is True:
+        # get approach vector
+        vector_path = np.array(
+            [contact_point, contact_point - approach_vector * 10.0]) * 1e-3
+        vector_path = trimesh.load_path(vector_path)
+
+        # set color
+        cmap = plt.get_cmap("bwr")
+        vector_path.colors = [(np.array(cmap(score)) * 255).astype(np.uint8)]
+
+        # visualize
+        scene = trimesh.Scene()
+        scene.add_geometry(meshes[np.argmin(dists)])
+        scene.add_geometry(vector_path)
+        scene.show()
+    return target_mesh_idx, score

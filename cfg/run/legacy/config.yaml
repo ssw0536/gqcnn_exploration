@@ -1,0 +1,45 @@
+simulation:
+  dt: 0.01
+  num_main_iters: 1000
+  num_sub_iters: 1
+  sync_frame_time: False
+
+camera:
+  phoxi:
+    fx: 525.0
+    fy: 525.0
+    cx: 320.0
+    cy: 240.0
+
+  primesense:
+    fx: 552.5
+    fy: 552.5
+    cx: 258.0
+    cy: 193.0
+
+object:
+  target_dataset: adv_obj_urdf
+  object_name: gearbox
+  random_pose_range: 0.1
+
+  random_method: single
+  random_single:
+    stable_pose_idx: 1
+    max_num_stable_pose: 20
+  random_multiple:
+    min_stable_pose_prob: 0.01
+    max_num_stable_pose: 50
+
+grasp_metric:
+  type: analytic
+
+  analytic:
+    num_edges: 8
+    finger_radius: 0.01
+    torque_scale: 1000.0
+    gripper_width: 0.085
+    quality_mtehod: 'ferrai_canny_l1'
+
+  simulation:
+    grasp_pose_z_offset: -0.005
+    gripper_width: 0.08

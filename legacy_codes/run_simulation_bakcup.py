@@ -15,13 +15,360 @@ from torch.utils.tensorboard import SummaryWriter
 from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
 
-from src.gqcnn import GQCNN
-from src.grasp_sampler import AntipodalGrasp, AntipodalGraspSampler
-from src.policy import (CrossEntropyGraspingPolicy,
-                        PosteriorGraspingPolicy,
-                        CrossEntorpyPosteriorGraspingPolicy,
-                        QLearningGraspingPolicy,)
+from src.grasp_planner import GraspPlanner
 from src.grasp_metric import ParallelJawGraspMetric
+
+
+class IsaacGymHandler(object):
+    def __init__(self, sim_cfg):
+        # parse arguments / isaacgym configuration
+        args = gymutil.parse_arguments(
+            description='GQ-CNN simulation',
+            headless=True,
+            no_graphics=True,
+        )
+
+        # initial parameters
+        self._dt = sim_cfg["dt"]
+        self._headless = args.headless
+        self._sync_frame_time = sim_cfg["sync_frame_time"]
+        self._enable_viewer_sync = True
+        self._wait_timer = 0.0
+
+        # create gym interface
+        self._gym = gymapi.acquire_gym()
+        self._sim = self._create_sim(self._gym, self._dt, args)
+        self._viewer = self._create_veiwer(self._gym, self._sim, self._headless)
+        self._device = "cuda:0" if args.use_gpu_pipeline else "cpu"
+
+    def __del__(self):
+        self._gym.destroy_sim(self._sim)
+        if not self._headless:
+            self._gym.destroy_viewer(self._viewer)
+
+    @staticmethod
+    def _create_sim(gym, dt, args):
+        """Create simulation.
+
+        Args:
+            gym (Gym): isaacgym gym
+            dt (float): simulation time step in seconds
+            args (argparse.Namespace): isaacgym arguments
+
+        Returns:
+            gymapi.Sim: isaacgym sim handler
+        """
+        # configure sim
+        # check `issacgy.gymapi.SimParams` for more options
+        sim_params = gymapi.SimParams()
+        sim_params.dt = dt
+
+        # set physics engine
+        if args.physics_engine == gymapi.SIM_FLEX:
+        # if args.physics_engine == gymapi.SIM_FLEX and not args.use_gpu_pipeline:
+            sim_params.substeps = 3
+            sim_params.flex.solver_type = 5
+            sim_params.flex.num_outer_iterations = 4
+            sim_params.flex.num_inner_iterations = 20
+            sim_params.flex.relaxation = 0.75
+            sim_params.flex.warm_start = 0.8
+            sim_params.flex.shape_collision_margin = 0.001
+            sim_params.flex.friction_mode = 2
+        elif args.physics_engine == gymapi.SIM_PHYSX:
+            sim_params.substeps = 5
+            sim_params.physx.solver_type = 4
+            sim_params.physx.num_position_iterations = 4
+            sim_params.physx.num_velocity_iterations = 1
+            sim_params.physx.num_threads = args.num_threads
+            sim_params.physx.use_gpu = args.use_gpu
+            sim_params.physx.rest_offset = 0.0
+        else:
+            raise Exception("GPU pipeline is only available with PhysX")
+
+        # set gpu pipeline
+        sim_params.use_gpu_pipeline = args.use_gpu_pipeline
+
+        # set up axis as Z-up
+        sim_params.up_axis = gymapi.UP_AXIS_Z
+        sim_params.gravity = gymapi.Vec3(0, 0, -9.81)
+
+        # create sim
+        sim = gym.create_sim(
+            args.compute_device_id,
+            args.graphics_device_id,
+            args.physics_engine,
+            sim_params)
+        if sim is None:
+            raise Exception("*** Failed to create sim")
+
+        # create ground plane
+        plane_params = gymapi.PlaneParams()
+        plane_params.normal = gymapi.Vec3(0, 0, 1)  # z-up!
+        plane_params.distance = 0
+        plane_params.static_friction = 0.3
+        plane_params.dynamic_friction = 0.15
+        plane_params.restitution = 0
+
+        return sim
+
+    @staticmethod
+    def _create_veiwer(gym, sim, headless):
+        """Create viewer.
+
+        Args:
+            gym (gymapi.Gym): isaacgym gym.
+            sim (gymapi.Sim): isaacgym sim handler.
+            headless (bool): whether to run in headless mode.
+
+        Returns:
+            gymapi.Viewer: isaacgym viewer handler. None if headless.
+        """
+        if headless:
+            return None
+        else:
+            # create viewer
+            viewer = gym.create_viewer(sim, gymapi.CameraProperties())
+
+            # set viewer camera pose
+            cam_pos = gymapi.Vec3(4.5, 3.0, 2.0)
+            cam_target = gymapi.Vec3(2.0, 0.5, 0.0)
+            gym.viewer_camera_look_at(viewer, None, cam_pos, cam_target)
+
+            # key callback
+            gym.subscribe_viewer_keyboard_event(
+                viewer, gymapi.KEY_ESCAPE, "QUIT")
+            gym.subscribe_viewer_keyboard_event(
+                viewer, gymapi.KEY_V, "toggle_viewer_sync")
+
+            if viewer is None:
+                raise Exception("*** Failed to create viewer")
+            return viewer
+
+    def render(self):
+        """Draw the frame to the viewer, and check for keyboard events."""
+        if self._viewer:
+            # check for window closed
+            if self._gym.query_viewer_has_closed(self._viewer):
+                exit()
+
+            # check for keyboard events
+            for evt in self._gym.query_viewer_action_events(self._viewer):
+                if evt.action == "QUIT" and evt.value > 0:
+                    exit()
+                elif evt.action == "toggle_viewer_sync" and evt.value > 0:
+                    self._enable_viewer_sync = not self._enable_viewer_sync
+
+            # step graphics
+            if self._enable_viewer_sync:
+                self._gym.step_graphics(self._sim)
+                self._gym.draw_viewer(self._viewer, self._sim, True)
+                if self._sync_frame_time:
+                    self._gym.sync_frame_time(self._sim)
+            else:
+                self._gym.step_graphics(self._sim)
+                self._gym.poll_viewer_events(self._viewer)
+
+        # step graphics for offscreen rendering
+        if self._headless:
+            self._gym.step_graphics(self._sim)
+
+    def wait(self, sleep_time=0.5):
+        """Wait for a given time in seconds.
+
+        Blocks the execution of the program for a given time in seconds.
+        Simulation steps are executed in the background.
+
+        Args:
+            sleep_time (float, optional): sleep time. Defaults to 0.5.
+
+        Returns:
+            success (bool): True if successful, False otherwise.
+        """
+        # wait for time seconds
+        while not self._wait_timer > sleep_time:
+            # step the physics
+            self._gym.simulate(self._sim)
+            # refresh results
+            self._gym.fetch_results(self._sim, True)
+            self._gym.refresh_dof_state_tensor(self._sim)
+            # step rendering
+            self.render()
+            # update timer
+            self._wait_timer += self._dt
+
+        self._wait_timer = 0.0
+        return True
+
+
+class HandHandler(object):
+    def __init__(self, gym_handler):
+        assert isinstance(gym_handler, IsaacGymHandler)
+        self._gym_handler = gym_handler
+
+        self._gripper_width = 0.08
+
+        self._asset, self._num_dofs = self._load_asset()
+
+        self._hand_handles = []
+        self._default_dof_pos = []
+
+    def _load_asset(self):
+        """Create environments."""
+        # get sim and gym handles
+        gym = self._gym_handler._gym
+        sim = self._gym_handler._sim
+
+        # load hand asset
+        asset_root = "./assets"
+        hand_asset_file = "urdf/franka_description/robots/franka_hand.urdf"
+        asset_options = gymapi.AssetOptions()
+        asset_options.armature = 0.01
+        asset_options.fix_base_link = True
+        asset_options.thickness = 0.001
+        asset_options.disable_gravity = True
+        asset_options.density = 1000
+        asset_options.override_inertia = True
+        asset_options.flip_visual_attachments = True
+        hand_asset = gym.load_asset(
+            sim, asset_root, hand_asset_file, asset_options)
+
+        # count num dofs
+        num_dofs = gym.get_asset_dof_count(hand_asset)
+        return hand_asset, num_dofs
+
+    def create_actor(self, env, group, filter):
+        # get sim and gym handles
+        gym = self._gym_handler._gym
+
+        # default hand pose
+        hand_offset = 1
+        hand_pose = gymapi.Transform()
+        hand_pose.p = gymapi.Vec3(0, 0, hand_offset + 0.1122)
+        hand_pose.r = gymapi.Quat(0, 1, 0, 0)
+
+        # default hand dof state
+        num_dofs = gym.get_asset_dof_count(self._asset)
+        default_dof_pos = np.array(
+            [0.0, 0.0, hand_offset, 0.0, self._gripper_width / 2.0, self._gripper_width / 2.0],
+            dtype=np.float32)
+        default_dof_state = np.zeros(num_dofs, gymapi.DofState.dtype)
+        default_dof_state["pos"] = default_dof_pos
+
+        # configure dof properties
+        hand_dof_props = gym.get_asset_dof_properties(self._asset)
+        hand_dof_props["driveMode"][:4].fill(gymapi.DOF_MODE_POS)
+        hand_dof_props["stiffness"][:4].fill(1000.0)
+        hand_dof_props["damping"][:4].fill(100.0)
+        hand_dof_props["driveMode"][4:].fill(gymapi.DOF_MODE_POS)
+        hand_dof_props["stiffness"][4:].fill(800.0)
+        hand_dof_props["damping"][4:].fill(40.0)
+
+        # create hand actor
+        hand_handle = gym.create_actor(
+            env, self._asset, hand_pose, "hand", group, filter)
+
+        # set hand dof states
+        gym.set_actor_dof_properties(env, hand_handle, hand_dof_props)
+        gym.set_actor_dof_states(env, hand_handle, default_dof_state, gymapi.STATE_ALL)
+        gym.set_actor_dof_position_targets(env, hand_handle, default_dof_pos)
+
+        # append hand handle
+        self._default_dof_pos.append(default_dof_pos)
+
+    def prepare_tensor(self, num_envs):
+        gym = self._gym_handler._gym
+        sim = self._gym_handler._sim
+        device = self._gym_handler._device
+
+        # get dof states
+        _dof_states = gym.acquire_dof_state_tensor(sim)
+        self._dof_states = gymtorch.wrap_tensor(_dof_states)
+        self._dof_pos = self._dof_states[:, 0].view(num_envs, self._num_dofs)
+        self._dof_vel = self._dof_states[:, 1].view(num_envs, self._num_dofs)
+
+        # make default dof pos tensor
+        self._default_dof_pos = np.array(self._default_dof_pos, dtype=np.float32)
+        self._default_dof_pos = torch.from_numpy(self._default_dof_pos).to(device)
+
+    def set_dof_position_targets(self, dof_position_targets):
+        """Set the target position of the hand dofs.
+
+        Args:
+            dof_position_targets (np.array): target positions of the hand dofs.
+        """
+        # get sim and gym handles
+        gym = self._gym_handler._gym
+        sim = self._gym_handler._sim
+
+        # set hand dof position targets
+        gym.set_dof_position_target_tensor(
+            sim, gymtorch.unwrap_tensor(dof_position_targets))
+
+    def get_dof_positions(self):
+        """Get the current position of the hand dofs.
+
+        Returns:
+            np.array: current positions of the hand dofs.
+        """
+        return torch.clone(self._dof_pos)
+
+
+class ObjectHandler(object):
+    def __init__(self, gym_handler, target_file):
+        self._gym_handler = gym_handler
+
+        self._asset = self._load_asset(target_file)
+        (self._stable_poses,
+         self._stable_probs) = self._load_stable_poses(target_file)
+
+    def _load_asset(self, target_file):
+        gym = self._gym_handler._gym
+        sim = self._gym_handler._sim
+
+        # load object asset
+        asset_root = "./assets"
+        asset_options = gymapi.AssetOptions()
+        asset_options.armature = 0.001
+        asset_options.fix_base_link = False
+        asset_options.thickness = 0.001
+        asset_options.override_inertia = True
+        asset_options.mesh_normal_mode = gymapi.COMPUTE_PER_VERTEX
+        if self.args.physics_engine == gymapi.SIM_PHYSX:
+            asset_options.vhacd_enabled = True
+            asset_options.vhacd_params.resolution = 300000
+            asset_options.vhacd_params.max_convex_hulls = 50
+            asset_options.vhacd_params.max_num_vertices_per_ch = 1000
+        object_asset = gym.load_asset(sim, asset_root, target_file, asset_options)
+        return object_asset
+
+    def _load_stable_poses(self, target_file):
+        stable_poses = np.load('assets/{}/stable_poses.npy'.format(target_file))
+        stable_probs = np.load('assets/{}/stable_prob.npy'.format(target_file))
+
+        # convert stable poses to gymapi.Transform
+        _stable_poses = []
+        for pose in stable_poses:
+            t = gymapi.Transform()
+            t.p = gymapi.Vec3(pose[0, 3], pose[1, 3], pose[2, 3])
+
+            # 3x3 rotation matrix to quaternion
+            r = R.from_matrix(pose[:3, :3])
+            quat = r.as_quat()
+            t.r = gymapi.Quat(quat[0], quat[1], quat[2], quat[3])
+            _stable_poses.append(t)
+        stable_poses = _stable_poses
+        return stable_poses, stable_probs
+
+    def create_actor(self, env, group, filter):
+        gym = self._gym_handler._gym
+        sim = self._gym_handler._sim
+
+        # create object actor  
+        random_pose = self._stable_poses[np.random.randint(len(self._stable_poses))]
+        handle = gym.create_actor(env, self._asset, random_pose, "object", group, filter)
+
+        # set segment properties
+        segment_props = gym.set_rigid_body_segmentation_id(env, handle, 0, 1)
 
 
 class SigulatePickingEnv(object):
@@ -36,57 +383,28 @@ class SigulatePickingEnv(object):
             no_graphics=True,
             custom_parameters=[
                 {
-                    "name": "--config",
-                    "type": str,
-                    "default": "cfg/config.yaml",
-                    "help": "configuration file"
-                },
-                {
                     "name": "--save_results",
                     "action": 'store_true',
                     "help": "Save the results"
                 },
             ],
         )
-        # self.num_envs = self.args.num_envs
         self.headless = self.args.headless
         self.save_results = self.args.save_results
-        config_file = self.args.config
 
-        # load configuration
-        with open(config_file, "r") as f:
-            cfg = yaml.safe_load(f)
-        sim_cfg = cfg["simulation"]
-        policy_cfg = cfg["policy"]
-        sampling_cfg = cfg["sampling"]
-        self.grasp_metric_cfg = cfg["grasp_metric"]
+        # set config files
+        sim_cfg_file = 'cfg/sim/config.yaml'
+        policy_cfg_file = 'cfg/policy/config.yaml'
 
-        # load gqcnn, sampler, and policy
-        gqcnn = GQCNN()
-        sampler = AntipodalGraspSampler(sampling_cfg)
-        if policy_cfg["type"] == "posterior":
-            self.policy = PosteriorGraspingPolicy(
-                gqcnn, sampler, policy_cfg)
-            self.num_update_features_per_step = policy_cfg["posterior"]["num_update_features_per_step"]
-        elif policy_cfg["type"] == "cross_entropy":
-            self.policy = CrossEntropyGraspingPolicy(
-                gqcnn, sampler, policy_cfg)
-        elif policy_cfg["type"] == "cross_entropy_posterior":
-            self.policy = CrossEntorpyPosteriorGraspingPolicy(
-                gqcnn, sampler, policy_cfg)
-            self.num_update_features_per_step = policy_cfg["cross_entropy_posterior"]["num_update_features_per_step"]
-        elif policy_cfg["type"] == "q_learning":
-            prior_gqcnn = GQCNN()
-            self.policy = QLearningGraspingPolicy(
-                gqcnn, prior_gqcnn, sampler, policy_cfg)
+        # load grasp planner
+        grasp_planner = GraspPlanner(policy_cfg_file)
 
-        # load parallel jaw grasp metric
-        # TODO: make in config file
-        ParallelJawGraspMetric.num_edges = 8
-        ParallelJawGraspMetric.finger_radius = 0.01
-        ParallelJawGraspMetric.torque_scale = 1000.0
-        ParallelJawGraspMetric.gripper_width = 0.8
-        ParallelJawGraspMetric.quality_method = 'ferrari_canny_l1'
+        # load sim config
+        _sim_cfg = yaml.load(open(sim_cfg_file), Loader=yaml.FullLoader)
+        sim_cfg = _sim_cfg['simulation']
+        object_cfg = _sim_cfg['object']
+        grasp_metric_cfg = _sim_cfg['grasp_metric']
+
 
         # set up simulation
         self.dt = sim_cfg["dt"]
