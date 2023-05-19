@@ -1,6 +1,6 @@
 from multiprocessing import Pool
 
-import time
+import scipy
 import numpy as np
 import trimesh
 import matplotlib.pyplot as plt
@@ -10,6 +10,11 @@ cvxopt.solvers.options['show_progress'] = False
 
 from .suction_model import suction_cup_lib as sclib
 from .suction_model import suction_cup_logic as scl
+
+
+def on_draw(viewer):
+    camera_transform = viewer.camera_transform
+    print(camera_transform)
 
 
 class RigidContactPoint(object):
@@ -178,12 +183,18 @@ class GraspQaulity(object):
         return min_norm, coef
 
 
+# If I use `Pool` for ParallelJawGraspMetric, it will cause some weird error
+# /home/sungwon/ws/projects/rl/exercise/venv/lib/python3.6/site-packages/
+# trimesh/ray/ray_triangle.py:398: RuntimeWarning: overflow encountered in
+# true_divide
+# The error is caused by rtree is not thread safe
 class ParallelJawGraspMetric(object):
     # constant parameters
     num_edges = 8
     finger_radius = 0.005
     torque_scale = 1000.0
     gripper_width = 0.085
+    gripper_height = 0.1
     quality_method = 'ferrari_canny_l1'
 
     @staticmethod
@@ -195,8 +206,23 @@ class ParallelJawGraspMetric(object):
         assert ParallelJawGraspMetric.quality_method is not None
 
     @staticmethod
-    def compute(mesh, grasp_pose, friction_coef, visualize=False, verbose=False):
-        """Get the parallel jaw contact wrenches from a mesh and a grasp pose.
+    def distance_to_line(points, line_point, line_direction):
+        """
+        Calculate the distance between a point and a line
+
+        Args:
+            points: (N, 3) numpy array of points
+            line_point: (3,) numpy array of a point on the line
+            line_direction: (3,) numpy array specifying the line direction
+
+        Returns:
+            (N,) numpy array of distances
+        """
+        return np.linalg.norm(np.cross(points - line_point, points - line_point - line_direction), axis=1) / np.linalg.norm(line_direction)
+
+    @staticmethod
+    def get_contact_points(mesh, grasp_pose, friction_coef, visualize=False, verbose=False):
+        """Get the parallel jaw contact points from a mesh and a grasp pose.
 
         Args:
             mesh (trimesh.Trimesh): Mesh to compute contact wrenches.
@@ -207,7 +233,6 @@ class ParallelJawGraspMetric(object):
             verbose (bool): whether to print debug information.
 
         Returns:
-            float: grasp quality. None if the grasp is not feasible.
             list of ContactPoint: contact points. None if the grasp is not feasible.
         """
         # check params
@@ -215,15 +240,10 @@ class ParallelJawGraspMetric(object):
 
         # get params
         gripper_width = ParallelJawGraspMetric.gripper_width
+        gripper_height = ParallelJawGraspMetric.gripper_height
         finger_radius = ParallelJawGraspMetric.finger_radius
         num_edges = ParallelJawGraspMetric.num_edges
         torque_scale = ParallelJawGraspMetric.torque_scale
-        quality_method = ParallelJawGraspMetric.quality_method
-
-        # smooth mesh
-        # mesh = copy.deepcopy(mesh)
-        # mesh = trimesh.smoothing.filter_humphrey(mesh, alpha=0.5, beta=0.5, iterations=10)
-        # assert isinstance(mesh, trimesh.Trimesh)
 
         # get grasp pose
         grasp_center = grasp_pose[:3, 3]
@@ -238,11 +258,11 @@ class ParallelJawGraspMetric(object):
         endpoint2 = grasp_center + grasp_axis * gripper_width / 2
 
         # visualize for debug
-        if visualize is True:
-            grasp_line = np.stack([endpoint1, endpoint2], axis=0)
-            grasp_line = trimesh.load_path(grasp_line)
-            geometry = [mesh, grasp_line]
-            trimesh.Scene(geometry=geometry).show(smooth=False)
+        # if visualize is True:
+        #     grasp_line = np.stack([endpoint1, endpoint2], axis=0)
+        #     grasp_line = trimesh.load_path(grasp_line)
+        #     geometry = [mesh, grasp_line]
+        #     trimesh.Scene(geometry=geometry).show(smooth=False)
 
         # check collision before closing the gripper
         ray_origin = np.stack([endpoint1, endpoint2], axis=0)
@@ -253,37 +273,37 @@ class ParallelJawGraspMetric(object):
         if np.any(is_collision):
             if verbose:
                 print('collision before closing the gripper')
-            return (None, None)
+            return None
 
         # close the gripper and get contact points
-        ray_origin = np.stack([endpoint1, endpoint2], axis=0)
-        ray_direction = np.stack([grasp_axis, -grasp_axis], axis=0)
+        grid_size = 0.001
+        num_rays = int(gripper_height / grid_size)
+        ray_origin = grasp_center - grasp_axis * gripper_width / 2
+        ray_origins = []
+        for i in range(num_rays):
+            ray_origins.append(ray_origin - grasp_approach * grid_size * i)
+        ray_directions = [grasp_axis] * num_rays
+        interesect_loc, _, interesect_tri_idx = rt.intersects_location(
+            ray_origins, ray_directions)
+        if len(interesect_loc) == 0:
+            if verbose:
+                print('no intersect points found while closing the gripper')
+            return None
 
+        # compute distance between contact points and grasp_axis
+        dists = ParallelJawGraspMetric.distance_to_line(
+            points=interesect_loc,
+            line_point=ray_origin,
+            line_direction=grasp_approach)
+
+        # get contact points
+        interesect_tri_idx1 = np.argmin(dists)
+        dists[dists > gripper_width] = -np.inf
+        interesect_tri_idx2 = np.argmax(dists)
         contact_poinsts = []
-        for i in range(2):
-            # set ray
-            cp_ray_origin = ray_origin[i]
-            cp_ray_direction = ray_direction[i]
-
-            # get contact point
-            cp_loc, _, cp_tri_idx = rt.intersects_location(
-                [cp_ray_origin],
-                [cp_ray_direction])
-            if len(cp_loc) == 0:
-                if verbose:
-                    print('no contact point found while closing the gripper')
-                return (None, None)
-
-            dist = np.linalg.norm(cp_loc - cp_ray_origin, axis=1)
-
-            if np.min(dist) > gripper_width / 2:
-                if verbose:
-                    print('no contact point found while closing the gripper')
-                return (None, None)
-            intersect_first_idx = np.argmin(dist)
-
-            cp_loc = cp_loc[intersect_first_idx]
-            cp_tri_idx = cp_tri_idx[intersect_first_idx]
+        for intersect_idx in [interesect_tri_idx1, interesect_tri_idx2]:
+            cp_loc = interesect_loc[intersect_idx]
+            cp_tri_idx = interesect_tri_idx[intersect_idx]
             cp_normal = -mesh.face_normals[cp_tri_idx]
             cp_tangent = mesh.triangles[cp_tri_idx][0] - mesh.triangles[cp_tri_idx][1]
             cp_tangent /= np.linalg.norm(cp_tangent)
@@ -300,25 +320,79 @@ class ParallelJawGraspMetric(object):
 
         # visualize for debug
         if visualize is True:
+            # set camera transform
+            camera_transform = np.array([
+                [ 0.99328917,  0.09502994, -0.06592377, -0.01804732],
+                [ 0.09646525, -0.36625786,  0.92549967,  0.30213444],
+                [ 0.06380508, -0.92564815, -0.37296705, -0.14623659],
+                [ 0.,          0.,          0.,          1.        ]])
+
+            # grasp line
             grasp_line = np.stack([endpoint1, endpoint2], axis=0)
             grasp_line = trimesh.load_path(grasp_line)
+            grasp_line.colors = [(0, 255, 0, 200)]
 
+            # friction cone
             friction_cone_lines = []
             for c in contact_poinsts:
                 for primitive_wrench in c.friction_cone:
                     friction_cone_lines.append(
                         [c.contact_point, c.contact_point - primitive_wrench * 0.01])
             friction_cone_lines = trimesh.load_path(friction_cone_lines)
+            friction_cone_lines.colors = [(255, 0, 0, 200)] * len(friction_cone_lines.entities)
 
-            geometry = [mesh, grasp_line, friction_cone_lines]
-            trimesh.Scene(geometry=geometry).show(smooth=False)
+            # jaw geometry
+            jaw1 = trimesh.primitives.Box([0.001, 0.001, gripper_height])  # x, y, z
+            jaw2 = trimesh.primitives.Box([0.001, 0.001, gripper_height])  # x, y, z
+            jaw1.apply_translation([gripper_width/2, 0.0, -gripper_height/2])
+            jaw2.apply_translation([-gripper_width/2, 0.0, -gripper_height/2])
+            jaw1.apply_transform(grasp_pose)
+            jaw2.apply_transform(grasp_pose)
 
+            # geometry
+            geometry = [mesh, grasp_line, friction_cone_lines, jaw1, jaw2]
+            scene = trimesh.Scene(geometry=geometry)
+            scene.camera_transform = camera_transform
+
+            # save as image
+            # random_hash = np.random.randint(0, 1000)
+            # img = scene.save_image(resolution=(1920, 1080), visible=True)
+            # with open('figs/robust_wrench/img_{:03d}.png'.format(random_hash), 'wb') as f:
+            #     f.write(img)
+            scene.show(smooth=False)
+
+        return contact_poinsts
+
+    @staticmethod
+    def compute(contact_points):
+        quality_method = 'ferrari_canny_l1'
         if quality_method == 'ferrari_canny_l1':
-            quality = GraspQaulity.ferrari_canny_l1(contact_poinsts)
+            quality = GraspQaulity.ferrari_canny_l1(contact_points)
+        return quality
 
-        return (quality, contact_poinsts)
+
+def add_noise_to_transform(tf, std_r, std_t):
+    """Add noise to the transform.
+
+    Args:
+        tf (np.ndarray): 4x4 homogenous matrix.
+        std_r (float): standard deviation of rotation noise.
+        std_t (float): standard deviation of translation noise.
+
+    Returns:
+        np.ndarray: 4x4 homogenous matrix.
+    """
+    so3 = np.random.normal(0, std_r, size=(3,))
+    noise_r = scipy.linalg.expm(np.cross(np.eye(3), so3))
+    noise_t = np.random.normal(0, std_t, size=(3, 1))
+    tf[:3, :3] = noise_r @ tf[:3, :3]
+    tf[:3, 3] += noise_t.flatten()
+    return tf
 
 
+# Previous multiprocessing makes wrong result.(2023-05-19)
+# parallel processing for grasp quality evaluation
+# Fixed on 2023-05-20
 def evaluate_pj_grasp(grasp_pose, meshes, mesh_poses):
     """Evaluate grasp quality for a parallel-jaw gripper on the scene.
 
@@ -329,48 +403,32 @@ def evaluate_pj_grasp(grasp_pose, meshes, mesh_poses):
 
     Returns:
         int: index of the target mesh
-        float: grasp success
+        float: grasp successp
     """
-    # get 3 close mesh from grasp pose
-    mesh_pose_xyz = mesh_poses[:, :3, 3]
-    grasp_pose_xyz = grasp_pose[:3, 3]
-    dist = np.linalg.norm(mesh_pose_xyz - grasp_pose_xyz, axis=1)
-    near_indices = np.argsort(dist)[:3]
+    # get closest mesh from grasp center point
+    grasp_pose_t = grasp_pose[:3, 3]
+    min_dists = []
+    for mesh in meshes:
+        min_dists.append(
+            mesh.nearest.on_surface([grasp_pose_t])[1][0])
+    target_mesh_idx = np.argmin(min_dists)
+    target_mesh = meshes[target_mesh_idx]
+    target_mesh_pose = mesh_poses[target_mesh_idx]
 
-    # meshes is list of trimesh.Trimesh
-    # gather meshes with near_indices
-    meshes = [meshes[i] for i in near_indices]
-    mesh_poses = mesh_poses[near_indices]
+    # get grasp pose in object frame
+    grasp_pose_object = np.linalg.inv(target_mesh_pose) @ grasp_pose
 
-    # gather inputs for parallel processing
-    input_tuple = []
-    for mesh, mesh_pose in zip(meshes, mesh_poses):
-        grasp_pose_object = np.linalg.inv(mesh_pose) @ grasp_pose
-        input_tuple.append((mesh, grasp_pose_object, 1.0, False, False))
+    # get contact points
+    contact_points = ParallelJawGraspMetric.get_contact_points(
+        target_mesh, grasp_pose_object, 1.0, False, False)
 
-    # parallel processing for grasp quality evaluation
-    with Pool(3) as p:
-        output = p.starmap(ParallelJawGraspMetric.compute, input_tuple)
-
-    # gather outputs
-    quality = []
-    for q, _ in output:
-        if q is None:
-            quality.append(0.0)
-        else:
-            quality.append(q)
-
-    # all quality is 0.0, return the first mesh
-    if np.count_nonzero(quality) == 0:
-        return near_indices[0], 0.0
-
-    # get the best quality
-    quality = quality[np.argmax(quality)]
-    target_mesh_idx = near_indices[np.argmax(quality)]
-    if quality > 0.002:
-        return target_mesh_idx, 1.0
+    # compute grasp quality
+    if contact_points is not None:
+        quality = ParallelJawGraspMetric.compute(contact_points)
     else:
-        return target_mesh_idx, 0.0
+        quality = 0.0
+
+    return target_mesh_idx, quality
 
 
 def evaluate_sc_grasp(grasp_pose, meshes, mesh_poses, visualize=False):
@@ -450,3 +508,60 @@ def evaluate_sc_grasp(grasp_pose, meshes, mesh_poses, visualize=False):
         scene.add_geometry(vector_path)
         scene.show()
     return target_mesh_idx, score
+
+
+def evaluate_robust_pj_grasp(grasp_pose, meshes, mesh_poses):
+    """Evaluate grasp quality for a parallel-jaw gripper on the scene.
+
+    Args:
+        grasp_pose (np.ndarray): 4x4 homogenous matrix of the grasp pose.
+        meshes (list of trimesh.Trimesh): meshes to be evaluated.
+        mesh_poses (np.ndarray): 4x4 homogenous matrix of the mesh poses.
+
+    Returns:
+        int: index of the target mesh
+        float: grasp successp
+    """
+    # get closest mesh from grasp center point
+    grasp_pose_t = grasp_pose[:3, 3]
+    min_dists = []
+    for mesh in meshes:
+        min_dists.append(
+            mesh.nearest.on_surface([grasp_pose_t])[1][0])
+    target_mesh_idx = np.argmin(min_dists)
+    target_mesh = meshes[target_mesh_idx]
+    target_mesh_pose = mesh_poses[target_mesh_idx]
+
+    # from `Learning ambidextrous robot grasping policies``
+    # can be found on `Supplementary Material`
+    num_samples = 10
+    grasp_r_std = 0.01
+    grasp_t_std = 0.0025
+    input_tuple = []
+    for _ in range(num_samples):
+        grasp_pose_object = np.linalg.inv(target_mesh_pose) @ grasp_pose
+        grasp_pose_object = add_noise_to_transform(
+            grasp_pose_object, grasp_r_std, grasp_t_std)
+        input_tuple.append((target_mesh, grasp_pose_object, 1.0, False, False))
+
+    # parallel processing for grasp quality evaluation
+    # If I use `Pool` here, it will cause some weird error
+    # /home/sungwon/ws/projects/rl/exercise/venv/lib/python3.6/site-packages/
+    # trimesh/ray/ray_triangle.py:398: RuntimeWarning: overflow encountered in
+    # true_divide
+    # The error is caused by rtree is not thread safe
+    contact_points = []
+    for i in range(num_samples):
+        cp = ParallelJawGraspMetric.get_contact_points(*input_tuple[i])
+        if cp is None:
+            continue
+        contact_points.append([cp])
+
+    # get grasp quality
+    with Pool(num_samples) as p:
+        quality = p.starmap(ParallelJawGraspMetric.compute, contact_points)
+
+    quality = [1.0 if q > 0.002 else 0.0 for q in quality]
+    robust_quality = np.sum(quality) / num_samples
+
+    return target_mesh_idx, robust_quality
