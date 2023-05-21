@@ -34,7 +34,7 @@ class RigidContactPoint(object):
         """
         self.center_of_mass = center_of_mass
         self.contact_point = contact_point
-        self.contact_noraml = contact_normal / np.linalg.norm(contact_normal)
+        self.contact_normal = contact_normal / np.linalg.norm(contact_normal)
         self.contact_tangent = contact_tangent / np.linalg.norm(contact_tangent)
 
         self.friction_coef = friction_coef
@@ -51,14 +51,14 @@ class RigidContactPoint(object):
         """
         # get tangent vectors
         tangent_u = self.contact_tangent
-        tangent_v = np.cross(self.contact_noraml, tangent_u)
+        tangent_v = np.cross(self.contact_normal, tangent_u)
         tangent_v /= np.linalg.norm(tangent_v)
 
         # get friction cone
         wrenches = []
         for theta in np.linspace(0, 2 * np.pi, self.num_edges, endpoint=False):
             tangent = self.friction_coef * (tangent_u * np.cos(theta) + tangent_v * np.sin(theta))
-            wrenches.append(self.contact_noraml + tangent)
+            wrenches.append(self.contact_normal + tangent)
         wrenches = np.array(wrenches)
         return wrenches
 
@@ -83,7 +83,7 @@ class RigidContactPoint(object):
             np.ndarray: (num_edges, 3) torsion at contact point.
         """
         area = np.pi * self.finger_radius**2
-        t = self.friction_coef * area * self.contact_noraml
+        t = self.friction_coef * area * self.contact_normal
         t *= self.torque_scale
         return t
 
@@ -163,7 +163,7 @@ class GraspQaulity(object):
         # create labmda matrix
         # add small value to diagonal to avoid singular matrix
         lambda_matrix = points.dot(points.T)
-        lambda_matrix = lambda_matrix + np.eye(num_vertices) * 1e-10
+        lambda_matrix = lambda_matrix + np.eye(num_vertices) * 1e-6
 
         # solve quadratic programming
         # min x'Qx + p'x
@@ -194,6 +194,7 @@ class ParallelJawGraspMetric(object):
     finger_radius = 0.005
     torque_scale = 1000.0
     gripper_width = 0.085
+    # gripper_height = 0.002
     gripper_height = 0.1
     quality_method = 'ferrari_canny_l1'
 
@@ -257,66 +258,102 @@ class ParallelJawGraspMetric(object):
         endpoint1 = grasp_center - grasp_axis * gripper_width / 2
         endpoint2 = grasp_center + grasp_axis * gripper_width / 2
 
-        # visualize for debug
-        # if visualize is True:
-        #     grasp_line = np.stack([endpoint1, endpoint2], axis=0)
-        #     grasp_line = trimesh.load_path(grasp_line)
-        #     geometry = [mesh, grasp_line]
-        #     trimesh.Scene(geometry=geometry).show(smooth=False)
-
         # check collision before closing the gripper
         ray_origin = np.stack([endpoint1, endpoint2], axis=0)
         ray_direction = np.stack([-grasp_approach, -grasp_approach], axis=0)
-        is_collision = rt.intersects_any(
+        collision_intersects = rt.intersects_any(
             ray_origins=ray_origin,
             ray_directions=ray_direction)  # (2,)
-        if np.any(is_collision):
+        is_collision = np.any(collision_intersects)
+
+        # close the gripper
+        is_contact = False
+        if not is_collision:
+            grid_size = 0.001
+            num_rays = int(gripper_height / grid_size)
+            ray_origin = grasp_center - grasp_axis * gripper_width / 2
+            ray_origins = []
+            for i in range(num_rays):
+                ray_origins.append(ray_origin - grasp_approach * grid_size * i)
+            ray_directions = [grasp_axis] * num_rays
+            interesect_loc, _, interesect_tri_idx = rt.intersects_location(
+                ray_origins, ray_directions)
+
+            if len(interesect_loc) > 1:
+                # compute distance between contact points and grasp_axis
+                dists = ParallelJawGraspMetric.distance_to_line(
+                    points=interesect_loc,
+                    line_point=ray_origin,
+                    line_direction=grasp_approach)
+
+                # remove points that are too far away(< gripper width)
+                interesect_loc = interesect_loc[dists < gripper_width]
+                interesect_tri_idx = interesect_tri_idx[dists < gripper_width]
+                dists = dists[dists < gripper_width]
+
+            # update is_contact
+            is_contact = (len(interesect_loc) > 1)
+        else:
             if verbose:
                 print('collision before closing the gripper')
-            return None
-
-        # close the gripper and get contact points
-        grid_size = 0.001
-        num_rays = int(gripper_height / grid_size)
-        ray_origin = grasp_center - grasp_axis * gripper_width / 2
-        ray_origins = []
-        for i in range(num_rays):
-            ray_origins.append(ray_origin - grasp_approach * grid_size * i)
-        ray_directions = [grasp_axis] * num_rays
-        interesect_loc, _, interesect_tri_idx = rt.intersects_location(
-            ray_origins, ray_directions)
-        if len(interesect_loc) == 0:
-            if verbose:
-                print('no intersect points found while closing the gripper')
-            return None
-
-        # compute distance between contact points and grasp_axis
-        dists = ParallelJawGraspMetric.distance_to_line(
-            points=interesect_loc,
-            line_point=ray_origin,
-            line_direction=grasp_approach)
 
         # get contact points
-        interesect_tri_idx1 = np.argmin(dists)
-        dists[dists > gripper_width] = -np.inf
-        interesect_tri_idx2 = np.argmax(dists)
-        contact_poinsts = []
-        for intersect_idx in [interesect_tri_idx1, interesect_tri_idx2]:
-            cp_loc = interesect_loc[intersect_idx]
-            cp_tri_idx = interesect_tri_idx[intersect_idx]
-            cp_normal = -mesh.face_normals[cp_tri_idx]
-            cp_tangent = mesh.triangles[cp_tri_idx][0] - mesh.triangles[cp_tri_idx][1]
-            cp_tangent /= np.linalg.norm(cp_tangent)
-            cp = RigidContactPoint(
-                center_of_mass=mesh.center_mass,
-                contact_point=cp_loc,
-                contact_normal=cp_normal,
-                contact_tangent=cp_tangent,
-                friction_coef=friction_coef,
-                num_edges=num_edges,
-                finger_radius=finger_radius,
-                torque_scale=torque_scale)
-            contact_poinsts.append(cp)
+        contact_poinsts = None
+        if (not is_collision) and is_contact:
+            # get contact points
+            interesect_tri_idx1 = np.argmin(dists)
+            dists[dists > gripper_width] = -np.inf
+            interesect_tri_idx2 = np.argmax(dists)
+
+            # get contact points
+            contact_poinsts = []
+            for intersect_idx in [interesect_tri_idx1, interesect_tri_idx2]:
+                cp_loc = interesect_loc[intersect_idx]
+                cp_tri_idx = interesect_tri_idx[intersect_idx]
+
+                # Use smooth normal
+                bary = trimesh.triangles.points_to_barycentric(
+                    [mesh.triangles[cp_tri_idx]], [cp_loc])
+                vertex_normals = mesh.vertex_normals[mesh.faces[cp_tri_idx]]
+                cp_normal = -np.sum(vertex_normals * bary.reshape(3, 1), axis=0)
+                cp_tangent = trimesh.unitize(np.random.rand(3))
+                while np.abs(cp_normal.dot(cp_tangent)) > 1e-4:
+                    cp_tangent = np.cross(cp_normal, np.random.rand(3))
+                    cp_tangent /= np.linalg.norm(cp_tangent)
+
+                # visualize vertex normal
+                # vertex_vectors = []
+                # vertices = mesh.vertices[mesh.faces[cp_tri_idx]]
+                # vertex_normals = mesh.vertex_normals[mesh.faces[cp_tri_idx]]
+                # for v, vn in zip(vertices, vertex_normals):
+                #     vertex_vectors.append([v, v + vn * 0.01])
+                # vertex_vectors = trimesh.load_path(vertex_vectors)
+                # vertex_vectors.colors = [(0, 0, 255, 200)] * len(vertex_vectors.entities)
+
+                # normal_vector = [[cp_loc, cp_loc + cp_normal * 0.01]]
+                # normal_vector = trimesh.load_path(normal_vector)
+                # normal_vector.colors = [(255, 0, 0, 200)] * len(normal_vector.entities)
+                # scene = trimesh.Scene(geometry=[mesh, vertex_vectors, normal_vector])
+                # scene.show()
+
+                # Use mesh noraml
+                # cp_normal = -mesh.face_normals[cp_tri_idx]
+                # cp_tangent = mesh.triangles[cp_tri_idx][0] - mesh.triangles[cp_tri_idx][1]
+                # cp_tangent /= np.linalg.norm(cp_tangent)
+
+                cp = RigidContactPoint(
+                    center_of_mass=mesh.center_mass,
+                    contact_point=cp_loc,
+                    contact_normal=cp_normal,
+                    contact_tangent=cp_tangent,
+                    friction_coef=friction_coef,
+                    num_edges=num_edges,
+                    finger_radius=finger_radius,
+                    torque_scale=torque_scale)
+                contact_poinsts.append(cp)
+        else:
+            if verbose:
+                print('intersect points found while closing the gripper is not 2')
 
         # visualize for debug
         if visualize is True:
@@ -334,12 +371,13 @@ class ParallelJawGraspMetric(object):
 
             # friction cone
             friction_cone_lines = []
-            for c in contact_poinsts:
-                for primitive_wrench in c.friction_cone:
-                    friction_cone_lines.append(
-                        [c.contact_point, c.contact_point - primitive_wrench * 0.01])
-            friction_cone_lines = trimesh.load_path(friction_cone_lines)
-            friction_cone_lines.colors = [(255, 0, 0, 200)] * len(friction_cone_lines.entities)
+            if contact_poinsts is not None:
+                for c in contact_poinsts:
+                    for primitive_wrench in c.friction_cone:
+                        friction_cone_lines.append(
+                            [c.contact_point, c.contact_point - primitive_wrench * 0.01])
+                friction_cone_lines = trimesh.load_path(friction_cone_lines)
+                friction_cone_lines.colors = [(255, 0, 0, 200)] * len(friction_cone_lines.entities)
 
             # jaw geometry
             jaw1 = trimesh.primitives.Box([0.001, 0.001, gripper_height])  # x, y, z
@@ -393,13 +431,13 @@ def add_noise_to_transform(tf, std_r, std_t):
 # Previous multiprocessing makes wrong result.(2023-05-19)
 # parallel processing for grasp quality evaluation
 # Fixed on 2023-05-20
-def evaluate_pj_grasp(grasp_pose, meshes, mesh_poses):
+def evaluate_pj_grasp(grasp_pose, meshes, mesh_poses, visualize=False):
     """Evaluate grasp quality for a parallel-jaw gripper on the scene.
 
     Args:
-        grasp_pose (np.ndarray): 4x4 homogenous matrix of the grasp pose.
+        grasp_pose (np.ndarray): 4x4 homogenous matrix of the grasp pose in world.
         meshes (list of trimesh.Trimesh): meshes to be evaluated.
-        mesh_poses (np.ndarray): 4x4 homogenous matrix of the mesh poses.
+        mesh_poses (np.ndarray): 4x4 homogenous matrix of the mesh poses in world.
 
     Returns:
         int: index of the target mesh
@@ -420,13 +458,14 @@ def evaluate_pj_grasp(grasp_pose, meshes, mesh_poses):
 
     # get contact points
     contact_points = ParallelJawGraspMetric.get_contact_points(
-        target_mesh, grasp_pose_object, 1.0, False, False)
+        target_mesh, grasp_pose_object, 1.0, visualize, False)
 
     # compute grasp quality
     if contact_points is not None:
         quality = ParallelJawGraspMetric.compute(contact_points)
     else:
         quality = 0.0
+    quality = 1.0 if quality > 0.002 else 0.0
 
     return target_mesh_idx, quality
 
@@ -561,7 +600,10 @@ def evaluate_robust_pj_grasp(grasp_pose, meshes, mesh_poses):
     with Pool(num_samples) as p:
         quality = p.starmap(ParallelJawGraspMetric.compute, contact_points)
 
+    # get robust quality
     quality = [1.0 if q > 0.002 else 0.0 for q in quality]
     robust_quality = np.sum(quality) / num_samples
 
+    # convert to grasp success
+    robust_quality = 1.0 if robust_quality >= 0.5 else 0.0
     return target_mesh_idx, robust_quality
